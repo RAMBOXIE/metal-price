@@ -64,7 +64,7 @@ function changeEmoji(pct) {
 }
 
 function formatChange(item) {
-  if (item.changePct == null) return '';
+  if (item.changePct == null) return '─';
   const sign = item.changePct >= 0 ? '▲' : '▼';
   return `${sign}${Math.abs(item.changePct).toFixed(2)}%`;
 }
@@ -104,12 +104,20 @@ function formatReport(prices, newsData) {
     const priceStr = formatPrice(item);
     const changeStr = formatChange(item);
     const unit = item.unit || '';
-    const exchange = item.exchange && item.exchange !== 'N/A' ? `[${item.exchange}]` : '';
+    const unitSuffix = unit.split('/')[1] || unit;
+
+    // 來源標籤：metalpriceapi/Stooq 顯示數據源，否則顯示交易所
+    let sourceTag = '';
+    if (item.source === 'metalpriceapi' || item.source === 'Stooq') {
+      sourceTag = `[${item.source}]`;
+    } else if (item.exchange && item.exchange !== 'N/A') {
+      sourceTag = `[${item.exchange}]`;
+    }
 
     if (item.price == null) {
-      lines.push(`🔵 ${item.name}（${sym}）暫無數據  ${item.source}`);
+      lines.push(`🔵 ${item.name}（${sym}）暫無數據`);
     } else {
-      lines.push(`${emoji} ${item.name}（${sym}）\$${priceStr}/${unit.split('/')[1] || unit}  ${changeStr}  ${exchange}`);
+      lines.push(`${emoji} ${item.name}（${sym}）\$${priceStr}/${unitSuffix}  ${changeStr}  ${sourceTag}`);
     }
   }
 
@@ -131,7 +139,7 @@ function formatReport(prices, newsData) {
   }
 
   lines.push('');
-  lines.push('_數據來源：Yahoo Finance / TradingEconomics_');
+  lines.push('_數據來源：Yahoo Finance / Stooq / metalpriceapi.com_');
 
   return lines.join('\n');
 }
