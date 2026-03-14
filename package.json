@@ -1,0 +1,10 @@
+{
+  "name": "metal-price",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node scripts/daily-report.mjs",
+    "prices": "node scripts/fetch-prices.mjs",
+    "news": "node scripts/fetch-news.mjs"
+  }
+}
