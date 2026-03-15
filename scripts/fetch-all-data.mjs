@@ -169,68 +169,34 @@ async function fetchMetalIndices() {
 }
 
 // ────────────────────────────────────────────
-// 3. Stooq 鉍現貨（BI.F, USD/t）
-// v5: 加入數據過期校驗（>30天=stale）+ 低價可靠性警告
+// 3. 鉍（Bi）參考報價
+// ────────────────────────────────────────────
+// 數據源調研結論（2026-03）：
+//   - Stooq BI.F 已廢棄：報價 $2,272/t，實際市場均價 ~$15,600/t，差距 7 倍，數據錯誤
+//   - CCMN 長江有色：36 個金屬列表中無鉍
+//   - SMM / Antaike / metalchina：需登錄或付費
+//   - metalprices.com / metalary.com：404 / 無法訪問
+// 結論：鉍目前無免費實時 API，使用手動更新的行業參考報價
+// 更新方式：修改下方 BISMUTH_REFERENCE 的數值即可
 // ────────────────────────────────────────────
 
-async function fetchStooqBismuth() {
-  // BI.F 單位與 AL.F 相同 = USD/t（metric ton）
-  // 注意：Stooq BI.F 報價約 $2,272/t，市場均價約 $6,600-13,200/t，差距較大
-  const url = 'https://stooq.com/q/l/?s=BI.F&f=sd2t2ohlcv&h&e=csv';
-  try {
-    const res = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const text = await res.text();
-    const lines = text.trim().split('\n');
-    if (lines.length < 2) throw new Error('Empty CSV');
-    const headers = lines[0].split(',').map(h => h.trim());
-    const vals = lines[1].split(',').map(v => v.trim());
-    const obj = {};
-    headers.forEach((h, i) => { obj[h] = vals[i]; });
-    if (obj['Close'] === 'N/D' || !obj['Close']) throw new Error('N/D');
-    const price = parseFloat(obj['Close']);
-    if (isNaN(price)) throw new Error('Invalid');
+const BISMUTH_REFERENCE = {
+  cny: 163000,          // 元/噸，精鉍主流報價均值（2026年3月中旬）
+  cnyRange: '161,000–164,000',  // 主流報價區間
+  usd: 15600,           // USD/t，CIF 均值（$15.5–15.7/kg）
+  usdRange: '15,500–15,700',    // CIF 報價區間 USD/t
+  unit: 'USD/t',
+  source: '行業報告',
+  updatedAt: '2026-03-15',      // 手動更新日期，超過 30 天時報告中加提示
+  note: '精鉍暫無免費實時API，以下為最近行業報告參考價，請定期手動更新',
+};
 
-    // 校驗數據日期是否過期（>30 天視為 stale）
-    const dataDate = obj['Date'] ?? null;
-    let stale = false;
-    let daysDiff = null;
-    if (dataDate) {
-      daysDiff = (Date.now() - new Date(dataDate).getTime()) / 86400000;
-      stale = daysDiff > 30;
-    }
-
-    if (stale) {
-      process.stderr.write(`[fetch-all-data] Stooq BI.F 數據過期 ${Math.floor(daysDiff)}d，標記 stale\n`);
-      return {
-        price: null,
-        unit: 'USD/t',
-        exchange: 'Stooq',
-        date: dataDate,
-        changePct: null,
-        staleNote: 'Stooq BI.F 數據過期，不可用',
-      };
-    }
-
-    // 數據是最新的，但價格低於市場均價（$6,600-13,200/t），加可靠性警告
-    const result = {
-      price: +price.toFixed(2),
-      unit: 'USD/t',
-      exchange: 'Stooq',
-      date: dataDate,
-      changePct: null,
-    };
-    if (price < 6000) {
-      result.reliabilityNote = 'Stooq BI.F 報價低於市場均價（$6,600-13,200/t），可靠性存疑';
-    }
-    return result;
-  } catch (err) {
-    process.stderr.write(`[fetch-all-data] Stooq BI.F 錯誤: ${err.message}\n`);
-    return null;
-  }
+function getBismuthReference() {
+  const updatedMs = new Date(BISMUTH_REFERENCE.updatedAt).getTime();
+  const daysSinceUpdate = (Date.now() - updatedMs) / 86400000;
+  const stale = daysSinceUpdate > 30;
+  process.stderr.write(`[fetch-all-data] 鉍參考報價：¥${BISMUTH_REFERENCE.cny}/t / $${BISMUTH_REFERENCE.usd}/t（更新於 ${BISMUTH_REFERENCE.updatedAt}${stale ? '，⚠️ 已超 30 天需更新' : ''}）\n`);
+  return { ...BISMUTH_REFERENCE, stale, daysSinceUpdate: Math.floor(daysSinceUpdate) };
 }
 
 // ────────────────────────────────────────────
@@ -631,6 +597,9 @@ async function main() {
   process.stderr.write(`[fetch-all-data] 遠期合約: 近月=${sym2}, 遠月=${sym6}\n`);
 
   // 並行抓取所有數據（v7 新增 metalIndices）
+  // 鉍：同步參考報價，不需要放進 Promise.all
+  const bismuth = getBismuthReference();
+
   const [
     ccmn,
     copperSpot,
@@ -638,7 +607,6 @@ async function main() {
     alumSpot,
     fwdNear,
     fwdFar,
-    bismuth,
     inventory,
     news,
     ibNews,
@@ -649,15 +617,14 @@ async function main() {
     fetchCcmnPrices(),
     fetchYahoo('HG=F'),
     fetchYahoo('ZNC=F'),
-    fetchYahoo('ALI=F'),          // 鋁現貨 $3,423/t USD
+    fetchYahoo('ALI=F'),          // 鋁現貨 USD/t
     fetchYahoo(sym2),
     fetchYahoo(sym6),
-    fetchStooqBismuth(),           // 鉍現貨 USD/t
     fetchLmeInventory(),
     fetchNews(),
     fetchIbNews(),
-    fetchSmmNews(),                // v4 新增：SMM快訊
-    fetchRedditCommodities(),      // v4 新增：Reddit情緒
+    fetchSmmNews(),
+    fetchRedditCommodities(),
     fetchMetalIndices(),           // v7 新增：有色行業指數
   ]);
 
@@ -708,18 +675,20 @@ async function main() {
       cny: ccmn?.cobalt?.price ?? null,
       cnyChange: ccmn?.cobalt?.updown ?? null,
     },
-    // 鉍（Bi）— 來自 Stooq BI.F，USD/t
-    // v5: 加入 staleNote / reliabilityNote 校驗字段
+    // 鉍（Bi）— 行業報告參考報價（無免費實時 API）
+    // Stooq BI.F 已廢棄（$2,272/t 錯誤，實際約 $15,600/t）
     bismuth: {
-      usd: bismuth?.price ?? null,
-      usdChangePct: bismuth?.changePct ?? null,  // Stooq CSV 無前日收盤，暫為 null
+      usd: bismuth.usd,
+      usdRange: bismuth.usdRange,      // CIF 報價區間 USD/t
       usdUnit: 'USD/t',
-      cny: null,
-      cnyChange: null,
-      source: bismuth ? 'Stooq/BI.F' : null,
-      dataDate: bismuth?.date ?? null,
-      ...(bismuth?.staleNote ? { staleNote: bismuth.staleNote } : {}),
-      ...(bismuth?.reliabilityNote ? { reliabilityNote: bismuth.reliabilityNote } : {}),
+      cny: bismuth.cny,
+      cnyRange: bismuth.cnyRange,      // 主流報價區間 元/噸
+      cnyUnit: '元/噸',
+      changePct: null,                 // 無日環比（非實時數據）
+      source: bismuth.source,
+      updatedAt: bismuth.updatedAt,
+      ...(bismuth.stale ? { staleWarning: `參考報價已超 ${bismuth.daysSinceUpdate} 天，建議更新 BISMUTH_REFERENCE` } : {}),
+      note: bismuth.note,
     },
   };
 
