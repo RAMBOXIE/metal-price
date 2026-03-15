@@ -1,7 +1,7 @@
 /**
  * fetch-prices.mjs
- * 抓取有色金屬現貨/期貨價格
- * 數據源：Yahoo Finance v8 API + MetalPriceAPI.com + Stooq
+ * 抓取有色金属现货/期货价格
+ * 数据源：Yahoo Finance v8 API + 长江有色(CCMN) + Stooq
  */
 
 import { readFileSync } from 'fs';
@@ -12,7 +12,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, '..');
 
 // ────────────────────────────────────────────
-// 讀取 .env
+// 读取 .env
 // ────────────────────────────────────────────
 function loadEnv() {
   const envPath = join(PROJECT_ROOT, '.env');
@@ -54,45 +54,39 @@ async function fetchYahooPrice(symbol, name, unit, exchange) {
     const currentPrice = meta.regularMarketPrice;
     const prevClose = meta.chartPreviousClose ?? meta.previousClose;
 
-    let changePercent = null;
     let changePct = null;
     if (prevClose && currentPrice) {
-      changePercent = currentPrice - prevClose;
-      changePct = ((currentPrice - prevClose) / prevClose) * 100;
+      changePct = +((currentPrice - prevClose) / prevClose * 100).toFixed(2);
     }
 
     return {
       name,
-      symbol,
-      price: currentPrice,
-      prevClose,
-      change: changePercent ? +changePercent.toFixed(4) : null,
-      changePct: changePct ? +changePct.toFixed(2) : null,
+      price: currentPrice ?? null,
+      changePct,
       unit,
       exchange,
       source: 'Yahoo Finance',
-      error: null,
+      ccmnPrice: null,
+      ccmnUpdown: null,
     };
   } catch (err) {
+    process.stderr.write(`[fetch-prices] Yahoo Finance ${symbol} error: ${err.message}\n`);
     return {
       name,
-      symbol,
       price: null,
-      prevClose: null,
-      change: null,
       changePct: null,
       unit,
       exchange,
       source: 'Yahoo Finance',
-      error: err.message,
+      ccmnPrice: null,
+      ccmnUpdown: null,
     };
   }
 }
 
 // ────────────────────────────────────────────
-// Stooq CSV API（鎳 NI.F 等）
-// 價格單位：美分/磅（cents/lb），需轉換為 USD/t
-// 1 USD/t = 1 cts/lb / 100 * 2204.62
+// Stooq CSV API（镍 NI.F 等，备用）
+// 价格单位：美分/磅（cents/lb），需转换为 USD/t
 // ────────────────────────────────────────────
 async function fetchStooqPrice(symbol, name, unit, exchange) {
   const url = `https://stooq.com/q/l/?s=${encodeURIComponent(symbol)}&f=sd2t2ohlcv&h&e=csv`;
@@ -111,15 +105,11 @@ async function fetchStooqPrice(symbol, name, unit, exchange) {
     const obj = {};
     headers.forEach((h, i) => { obj[h] = values[i]; });
 
-    if (obj['Close'] === 'N/D' || !obj['Close']) {
-      throw new Error('No data (N/D)');
-    }
+    if (obj['Close'] === 'N/D' || !obj['Close']) throw new Error('No data (N/D)');
 
     const rawPrice = parseFloat(obj['Close']);
     if (isNaN(rawPrice)) throw new Error('Invalid price');
 
-    // Stooq 金屬期貨價格單位：美分/磅（cents/lb）
-    // 轉換為 USD/t：rawPrice / 100 * 2204.62
     let price = rawPrice;
     if (unit === 'USD/t') {
       price = +(rawPrice / 100 * 2204.62).toFixed(2);
@@ -127,158 +117,154 @@ async function fetchStooqPrice(symbol, name, unit, exchange) {
 
     return {
       name,
-      symbol,
       price,
-      prevClose: null,
-      change: null,
       changePct: null,
       unit,
       exchange,
       source: 'Stooq',
-      error: null,
+      ccmnPrice: null,
+      ccmnUpdown: null,
     };
   } catch (err) {
+    process.stderr.write(`[fetch-prices] Stooq ${symbol} error: ${err.message}\n`);
     return {
       name,
-      symbol,
       price: null,
-      prevClose: null,
-      change: null,
       changePct: null,
       unit,
       exchange,
       source: 'Stooq',
-      error: err.message,
+      ccmnPrice: null,
+      ccmnUpdown: null,
     };
   }
 }
 
 // ────────────────────────────────────────────
-// MetalPriceAPI.com
-// 免費版僅支持貴金屬（XAU/XAG/XPT/XPD）及外匯
-// 工業金屬（鎳 NI、鈷 XCO 等）需要付費計劃
+// 长江有色 CCMN API
+// 提供 Cu/Zn/Ni/Co 人民币现货价 + 涨跌额
 // ────────────────────────────────────────────
-async function fetchMetalPriceApi() {
-  const env = loadEnv();
-  const apiKey = env.METAL_PRICE_API_KEY;
-  if (!apiKey) {
-    return { nickel: null, cobalt: null, bismuth: null };
-  }
+async function fetchCcmnPrices() {
+  const url = 'https://m.ccmn.cn/mhangqing/getCorpStmarketPriceList?marketVmid=40288092327140f601327141c0560001';
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'Referer': 'https://m.ccmn.cn/mhangqing/mcjxh/',
+        'X-Requested-With': 'XMLHttpRequest',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data.success) throw new Error(data.msg || 'API error');
 
-  const makeResult = (name, symbol, unit, exchange, price, error) => ({
-    name,
-    symbol,
-    price: price ?? null,
-    prevClose: null,
-    change: null,       // 免費版無昨日數據，不提供漲跌
-    changePct: null,
-    unit,
-    exchange,
-    source: 'metalpriceapi',
-    error: error ?? null,
-  });
+    const list = data.body?.priceList;
+    if (!Array.isArray(list)) throw new Error('No priceList in response');
 
-  // 嘗試請求工業金屬：鎳(NI)、鈷(XCO)、鉍(XBI 不存在)
-  // 免費版這些 symbol 都需要付費計劃，記錄錯誤供升級後使用
-  const symbolMap = [
-    { key: 'nickel',  symbol: 'NI',  name: '鎳', unit: 'USD/t', exchange: 'LME' },
-    { key: 'cobalt',  symbol: 'XCO', name: '鈷', unit: 'USD/t', exchange: 'LME' },
-    { key: 'bismuth', symbol: 'XBI', name: '鉍', unit: 'USD/t', exchange: 'N/A' },
-  ];
+    // productSortName -> key 映射
+    const nameMap = {
+      '1#铜': 'copper',
+      '0#锌': 'zinc',
+      '1#镍': 'nickel',
+      '1#钴': 'cobalt',
+    };
 
-  const results = {};
+    const result = { copper: null, zinc: null, nickel: null, cobalt: null };
 
-  for (const item of symbolMap) {
-    const url = `https://api.metalpriceapi.com/v1/latest?api_key=${apiKey}&base=USD&currencies=${item.symbol}`;
-    try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-      const data = await res.json();
-
-      if (!data.success) {
-        const errCode = data.error?.statusCode;
-        let errMsg = data.error?.message || 'API error';
-        // 416 = requires paid plan, 300 = symbol not found
-        results[item.key] = makeResult(item.name, item.symbol, item.unit, item.exchange, null, errMsg);
-      } else {
-        const rate = data.rates?.[item.symbol];
-        if (rate == null) {
-          results[item.key] = makeResult(item.name, item.symbol, item.unit, item.exchange, null, 'Symbol not in response');
-        } else {
-          // rates 是「1 USD 能買多少單位」，取倒數得每單位 USD 價格
-          // 注意：metalpriceapi 金屬單位為 troy oz，工業金屬如有則需另行換算
-          let price = 1 / rate;
-          results[item.key] = makeResult(item.name, item.symbol, item.unit, item.exchange, +price.toFixed(2), null);
-        }
+    for (const item of list) {
+      const key = nameMap[item.productSortName];
+      if (key) {
+        const price = parseFloat(item.avgPrice);
+        const updown = parseFloat(item.highsLowsAmount);
+        result[key] = {
+          price: isNaN(price) ? null : price,
+          updown: isNaN(updown) ? null : updown,
+        };
       }
-    } catch (err) {
-      results[item.key] = makeResult(item.name, item.symbol, item.unit, item.exchange, null, err.message);
     }
-  }
 
-  return results;
+    return result;
+  } catch (err) {
+    process.stderr.write(`[fetch-prices] CCMN API error: ${err.message}\n`);
+    return null;
+  }
 }
 
 // ────────────────────────────────────────────
-// 主函數
+// 主函数
 // ────────────────────────────────────────────
 async function main() {
-  // 1. Yahoo Finance：銅/鋅（保持不變）
-  const [copper, zinc] = await Promise.all([
-    fetchYahooPrice('HG=F', '銅', 'USD/lb', 'COMEX'),
-    fetchYahooPrice('ZNC=F', '鋅', 'USD/t',  'LME'),
+  // 1. 并行：Yahoo Finance (Cu/Zn USD) + CCMN (Cu/Zn/Ni/Co CNY)
+  const [copperRaw, zincRaw, ccmn] = await Promise.all([
+    fetchYahooPrice('HG=F', '铜', 'USD/lb', 'COMEX'),
+    fetchYahooPrice('ZNC=F', '锌', 'USD/t',  'LME'),
+    fetchCcmnPrices(),
   ]);
 
-  // 2. MetalPriceAPI：嘗試鎳/鈷/鉍（免費版受限，記錄結果）
-  const metalApiResults = await fetchMetalPriceApi();
+  // 2. Cu：Yahoo Finance 为主，CCMN 补充人民币数据
+  const copper = {
+    ...copperRaw,
+    ccmnPrice: ccmn?.copper?.price ?? null,
+    ccmnUpdown: ccmn?.copper?.updown ?? null,
+  };
 
-  // 3. 鎳：若 metalpriceapi 失敗（受限於免費計劃），回退到 Stooq NI.F
-  let nickel = metalApiResults.nickel;
-  if (!nickel || nickel.price === null) {
-    const stooqNickel = await fetchStooqPrice('NI.F', '鎳', 'USD/t', 'LME');
-    if (stooqNickel.price !== null) {
-      nickel = stooqNickel;
-      if (metalApiResults.nickel?.error) {
-        process.stderr.write(`[fetch-prices] metalpriceapi 鎳受限(${metalApiResults.nickel.error})，已回退到 Stooq\n`);
-      }
-    } else {
-      nickel = metalApiResults.nickel || stooqNickel;
-    }
-  }
+  // 3. Zn：Yahoo Finance 为主，CCMN 补充人民币数据
+  const zinc = {
+    ...zincRaw,
+    ccmnPrice: ccmn?.zinc?.price ?? null,
+    ccmnUpdown: ccmn?.zinc?.updown ?? null,
+  };
 
-  // 4. 鈷：metalpriceapi 結果（免費版暫無，升級後可用）
-  let cobalt = metalApiResults.cobalt;
-  if (!cobalt || cobalt.price === null) {
-    // 暫無免費數據源
-    cobalt = {
-      name: '鈷',
-      symbol: 'XCO',
+  // 4. Ni：优先 CCMN（有涨跌数据），Stooq 作备用
+  let nickel;
+  if (ccmn?.nickel?.price != null) {
+    nickel = {
+      name: '镍',
       price: null,
-      prevClose: null,
-      change: null,
       changePct: null,
-      unit: 'USD/t',
-      exchange: 'LME',
-      source: 'metalpriceapi',
-      error: cobalt?.error || '免費版不支援，需升級付費計劃',
+      unit: 'CNY/t',
+      exchange: '長江現貨',
+      source: 'ccmn',
+      ccmnPrice: ccmn.nickel.price,
+      ccmnUpdown: ccmn.nickel.updown,
+    };
+  } else {
+    process.stderr.write('[fetch-prices] CCMN 镍数据不可用，回退到 Stooq\n');
+    const stooqNi = await fetchStooqPrice('NI.F', '镍', 'USD/t', 'LME');
+    nickel = {
+      ...stooqNi,
+      ccmnPrice: null,
+      ccmnUpdown: null,
     };
   }
 
-  // 5. 鉍：暫無免費數據源（XBI symbol 不存在）
-  const bismuth = {
-    name: '鉍',
-    symbol: 'XBI',
+  // 5. Co：优先 CCMN（唯一免费来源），失败则 null
+  const cobalt = {
+    name: '钴',
     price: null,
-    prevClose: null,
-    change: null,
+    changePct: null,
+    unit: 'CNY/t',
+    exchange: '長江現貨',
+    source: ccmn?.cobalt?.price != null ? 'ccmn' : 'none',
+    ccmnPrice: ccmn?.cobalt?.price ?? null,
+    ccmnUpdown: ccmn?.cobalt?.updown ?? null,
+  };
+
+  // 6. Bi：暂无免费数据源
+  const bismuth = {
+    name: '铋',
+    price: null,
     changePct: null,
     unit: 'USD/t',
     exchange: 'N/A',
-    source: 'metalpriceapi',
-    error: metalApiResults.bismuth?.error || 'Symbol not found',
+    source: 'none',
+    ccmnPrice: null,
+    ccmnUpdown: null,
   };
 
   const results = [copper, zinc, nickel, cobalt, bismuth];
-  console.log(JSON.stringify(results, null, 2));
+  console.log(JSON.stringify(results));
 }
 
 main().catch(err => {
