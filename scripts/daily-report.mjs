@@ -267,7 +267,7 @@ async function main() {
   // 读取 Telegram 配置
   const env = loadEnv();
   const token = env.TELEGRAM_BOT_TOKEN;
-  const chatId = env.TELEGRAM_CHAT_ID || '2074812988';
+  const chatId = env.TELEGRAM_CHAT_ID;
 
   if (!token) {
     console.log('[daily-report] ⚠️  未配置 TELEGRAM_BOT_TOKEN，跳过发送');
