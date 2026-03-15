@@ -169,34 +169,79 @@ async function fetchMetalIndices() {
 }
 
 // ────────────────────────────────────────────
-// 3. 鉍（Bi）參考報價
+// 3. 鉍（Bi）— SMM 上海有色網 h5 頁面（免費，__NEXT_DATA__ 嵌入）
 // ────────────────────────────────────────────
-// 數據源調研結論（2026-03）：
-//   - Stooq BI.F 已廢棄：報價 $2,272/t，實際市場均價 ~$15,600/t，差距 7 倍，數據錯誤
-//   - CCMN 長江有色：36 個金屬列表中無鉍
-//   - SMM / Antaike / metalchina：需登錄或付費
-//   - metalprices.com / metalary.com：404 / 無法訪問
-// 結論：鉍目前無免費實時 API，使用手動更新的行業參考報價
-// 更新方式：修改下方 BISMUTH_REFERENCE 的數值即可
+// URL: https://hq.smm.cn/h5/bismuth-price
+// 數據：精鉍價格(CNY/t) + 精鉍CIF(USD/kg) + 4N/5N三氧化二鉍(CNY/t)
+// 欄位：high / low / average / vchange(日變動絕對值) / vchange_rate(%) / renew_date
+// 無需登錄，__NEXT_DATA__ 直接嵌入完整 JSON
 // ────────────────────────────────────────────
 
-const BISMUTH_REFERENCE = {
-  cny: 163000,          // 元/噸，精鉍主流報價均值（2026年3月中旬）
-  cnyRange: '161,000–164,000',  // 主流報價區間
-  usd: 15600,           // USD/t，CIF 均值（$15.5–15.7/kg）
-  usdRange: '15,500–15,700',    // CIF 報價區間 USD/t
-  unit: 'USD/t',
-  source: '行業報告',
-  updatedAt: '2026-03-15',      // 手動更新日期，超過 30 天時報告中加提示
-  note: '精鉍暫無免費實時API，以下為最近行業報告參考價，請定期手動更新',
-};
+async function fetchSmmBismuth() {
+  try {
+    const res = await fetch('https://hq.smm.cn/h5/bismuth-price', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept-Language': 'zh-CN,zh;q=0.9',
+        'Referer': 'https://www.smm.cn/',
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = await res.text();
 
-function getBismuthReference() {
-  const updatedMs = new Date(BISMUTH_REFERENCE.updatedAt).getTime();
-  const daysSinceUpdate = (Date.now() - updatedMs) / 86400000;
-  const stale = daysSinceUpdate > 30;
-  process.stderr.write(`[fetch-all-data] 鉍參考報價：¥${BISMUTH_REFERENCE.cny}/t / $${BISMUTH_REFERENCE.usd}/t（更新於 ${BISMUTH_REFERENCE.updatedAt}${stale ? '，⚠️ 已超 30 天需更新' : ''}）\n`);
-  return { ...BISMUTH_REFERENCE, stale, daysSinceUpdate: Math.floor(daysSinceUpdate) };
+    // 解析 __NEXT_DATA__
+    const nd = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (!nd) throw new Error('__NEXT_DATA__ not found');
+    const json = JSON.parse(nd[1]);
+
+    const sections = json?.props?.pageProps?.datas?.BIP01?.data;
+    if (!Array.isArray(sections)) throw new Error('BIP01 data not found');
+
+    const result = { cny: null, usd: null, source: 'SMM/hq.smm.cn' };
+
+    for (const section of sections) {
+      for (const item of (section.data || [])) {
+        const name = item.product_name || '';
+        // 铋 = U+94CB
+        // 精铋价格 (CNY/t)：name 含「铋」且不含 CIF，unit 含「元」
+        if (name.includes('\u94cb') && !name.includes('CIF') && item.unit && item.unit.includes('\u5143') && !name.includes('N\u4e09')) {
+          result.cny = {
+            average: item.average,
+            high: item.high,
+            low: item.low,
+            change: item.vchange,
+            changePct: item.vchange_rate,
+            unit: item.unit,
+            dataDate: item.renew_date,
+          };
+        } else if (name.includes('\u94cb') && name.includes('CIF')) {
+          // 精铋CIF价格 (USD/kg → 換算 USD/t)
+          const avgUsdPerKg = item.average;
+          result.usd = {
+            averagePerKg: avgUsdPerKg,
+            average: avgUsdPerKg != null ? +(avgUsdPerKg * 1000).toFixed(0) : null, // USD/t
+            high: item.high != null ? item.high * 1000 : null,
+            low: item.low != null ? item.low * 1000 : null,
+            change: item.vchange != null ? +(item.vchange * 1000).toFixed(0) : null,
+            changePct: item.vchange_rate,
+            unit: 'USD/t',
+            dataDate: item.renew_date,
+          };
+        }
+      }
+    }
+
+    if (!result.cny && !result.usd) throw new Error('No bismuth prices found in page');
+
+    const cnyAvg = result.cny?.average;
+    const usdAvg = result.usd?.average;
+    process.stderr.write(`[fetch-all-data] SMM 鉍價格：¥${cnyAvg}/t（日變動 ${result.cny?.change}）/ $${usdAvg}/t CIF\n`);
+    return result;
+  } catch (err) {
+    process.stderr.write(`[fetch-all-data] SMM 鉍抓取失敗: ${err.message}\n`);
+    return null;
+  }
 }
 
 // ────────────────────────────────────────────
@@ -597,9 +642,6 @@ async function main() {
   process.stderr.write(`[fetch-all-data] 遠期合約: 近月=${sym2}, 遠月=${sym6}\n`);
 
   // 並行抓取所有數據（v7 新增 metalIndices）
-  // 鉍：同步參考報價，不需要放進 Promise.all
-  const bismuth = getBismuthReference();
-
   const [
     ccmn,
     copperSpot,
@@ -607,6 +649,7 @@ async function main() {
     alumSpot,
     fwdNear,
     fwdFar,
+    bismuth,
     inventory,
     news,
     ibNews,
@@ -620,12 +663,13 @@ async function main() {
     fetchYahoo('ALI=F'),          // 鋁現貨 USD/t
     fetchYahoo(sym2),
     fetchYahoo(sym6),
+    fetchSmmBismuth(),             // 鉍：SMM h5 頁面實時數據
     fetchLmeInventory(),
     fetchNews(),
     fetchIbNews(),
     fetchSmmNews(),
     fetchRedditCommodities(),
-    fetchMetalIndices(),           // v7 新增：有色行業指數
+    fetchMetalIndices(),
   ]);
 
   // 升級一：dataDate / isMarketOpen / marketNote
@@ -675,20 +719,26 @@ async function main() {
       cny: ccmn?.cobalt?.price ?? null,
       cnyChange: ccmn?.cobalt?.updown ?? null,
     },
-    // 鉍（Bi）— 行業報告參考報價（無免費實時 API）
-    // Stooq BI.F 已廢棄（$2,272/t 錯誤，實際約 $15,600/t）
-    bismuth: {
-      usd: bismuth.usd,
-      usdRange: bismuth.usdRange,      // CIF 報價區間 USD/t
+    // 鉍（Bi）— SMM 上海有色網實時數據
+    bismuth: bismuth ? {
+      cny: bismuth.cny?.average ?? null,
+      cnyHigh: bismuth.cny?.high ?? null,
+      cnyLow: bismuth.cny?.low ?? null,
+      cnyChange: bismuth.cny?.change ?? null,       // 日環比絕對值 元/噸
+      cnyChangePct: bismuth.cny?.changePct ?? null, // 日環比 %
+      cnyUnit: '\u5143/\u5428',
+      usd: bismuth.usd?.average ?? null,            // USD/t (CIF)
+      usdHigh: bismuth.usd?.high ?? null,
+      usdLow: bismuth.usd?.low ?? null,
+      usdChange: bismuth.usd?.change ?? null,
+      usdChangePct: bismuth.usd?.changePct ?? null,
       usdUnit: 'USD/t',
-      cny: bismuth.cny,
-      cnyRange: bismuth.cnyRange,      // 主流報價區間 元/噸
-      cnyUnit: '元/噸',
-      changePct: null,                 // 無日環比（非實時數據）
+      dataDate: bismuth.cny?.dataDate ?? bismuth.usd?.dataDate ?? null,
       source: bismuth.source,
-      updatedAt: bismuth.updatedAt,
-      ...(bismuth.stale ? { staleWarning: `參考報價已超 ${bismuth.daysSinceUpdate} 天，建議更新 BISMUTH_REFERENCE` } : {}),
-      note: bismuth.note,
+    } : {
+      cny: null, usd: null,
+      source: null,
+      note: 'SMM\u9285\u53d6\u5931\u6557\uff0c\u66ab\u7121\u9209\u6578\u64da',
     },
   };
 
