@@ -999,14 +999,16 @@ async function main() {
         note: smmCross.nickel.productName,
       } : null,
     },
-    // 數據可用性說明（供分析師了解數據缺口）
+    // 數據可用性說明（v8 更新：鋁CNY已從CCMN補齊；新增鉛/錫）
     dataAvailability: {
       copper:  { usd: 'Yahoo HG=F ✅', cny: 'CCMN ✅ / SMM長江✅（交叉驗證）' },
-      zinc:    { usd: '❌ 無免費源（ZNC=F prevClose過期作廢；SMM無USD報價）', cny: 'CCMN ✅ / SMM上海✅' },
-      aluminum:{ usd: 'Yahoo ALI=F ✅', cny: '❌ 無免費源（SMM al-price 404；CCMN A00鋁未採集）' },
-      nickel:  { usd: '❌ 無免費源（SMM無USD；LME被Cloudflare封）', cny: 'CCMN ✅ / SMM長江✅' },
-      cobalt:  { usd: '❌ 無免費源（鈷不在LME標準合約；SMM cobalt-price 404）', cny: 'CCMN ✅' },
-      bismuth: { usd: 'SMM CIF ✅（USD/kg×1000）', cny: 'SMM精鉍 ✅' },
+      zinc:    { usd: '❌ 無免費源（ZNC=F廢棄；SMM無LME USD頁面）', cny: 'CCMN ✅ / SMM上海0#✅（交叉驗證）' },
+      aluminum:{ usd: 'Yahoo ALI=F ✅', cny: ccmn?.aluminum?.price ? 'CCMN A00鋁 ✅' : '❌ CCMN無A00鋁數據（可能休市）' },
+      nickel:  { usd: '❌ 無免費源（SMM無LME USD頁面；LME被Cloudflare封）', cny: 'CCMN ✅ / SMM電解鎳✅（交叉驗證）' },
+      cobalt:  { usd: '❌ 無免費源（SMM cobalt-price 404；鈷非標準LME合約）', cny: 'CCMN ✅' },
+      bismuth: { usd: 'SMM CIF ✅（精鉍USD/kg×1000）', cny: 'SMM精鉍 ✅' },
+      lead:    { usd: '❌ 無免費源', cny: smmLead ? 'SMM長江鉛錠 ✅（v8新增）' : '❌ SMM抓取失敗' },
+      tin:     { usd: '❌ 無免費源', cny: smmTin  ? 'SMM長江錫錠 ✅（v8新增）' : '❌ SMM抓取失敗' },
       lmeInventory: '❌ Cloudflare全面封鎖（全部HTTP 403）',
     },
     news,
