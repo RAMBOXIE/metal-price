@@ -47,6 +47,8 @@ async function fetchCcmnPrices() {
       '0#锌': 'zinc',
       '1#镍': 'nickel',
       '1#钴': 'cobalt',
+      'A00铝': 'aluminum',  // v8 新增：嘗試從 CCMN 獲取鋁價
+      '1#铝': 'aluminum',   // 備用牌號
     };
 
     // 升級一：提取 dataDate 與 isMarketOpen
@@ -56,7 +58,7 @@ async function fetchCcmnPrices() {
     const todaySH = today();
     const isMarketOpen = dataDate ? (dataDate === todaySH) : null;
 
-    const result = { copper: null, zinc: null, nickel: null, cobalt: null, dataDate, isMarketOpen };
+    const result = { copper: null, zinc: null, nickel: null, cobalt: null, aluminum: null, dataDate, isMarketOpen };
     for (const item of list) {
       const key = nameMap[item.productSortName];
       if (key) {
@@ -205,13 +207,14 @@ async function fetchSmmBismuth() {
         const name = item.product_name || '';
         // 铋 = U+94CB
         // 精铋价格 (CNY/t)：name 含「铋」且不含 CIF，unit 含「元」
+        // ⚠️ SMM vchange_rate 為小數格式（如 -0.0033 = -0.33%），需 ×100 轉為百分比
         if (name.includes('\u94cb') && !name.includes('CIF') && item.unit && item.unit.includes('\u5143') && !name.includes('N\u4e09')) {
           result.cny = {
             average: item.average,
             high: item.high,
             low: item.low,
             change: item.vchange,
-            changePct: item.vchange_rate,
+            changePct: item.vchange_rate != null ? +(item.vchange_rate * 100).toFixed(4) : null,
             unit: item.unit,
             dataDate: item.renew_date,
           };
@@ -224,7 +227,7 @@ async function fetchSmmBismuth() {
             high: item.high != null ? item.high * 1000 : null,
             low: item.low != null ? item.low * 1000 : null,
             change: item.vchange != null ? +(item.vchange * 1000).toFixed(0) : null,
-            changePct: item.vchange_rate,
+            changePct: item.vchange_rate != null ? +(item.vchange_rate * 100).toFixed(4) : null,
             unit: 'USD/t',
             dataDate: item.renew_date,
           };
@@ -242,6 +245,140 @@ async function fetchSmmBismuth() {
     process.stderr.write(`[fetch-all-data] SMM 鉍抓取失敗: ${err.message}\n`);
     return null;
   }
+}
+
+// ────────────────────────────────────────────
+// 3b. SMM 長江現貨交叉驗證（Cu / Zn / Ni）
+// ────────────────────────────────────────────
+// 數據源調研結論（2026-03）：
+//   ✅ cu-price: 長江現貨銅價 / ✅ zn-price: 長江現貨鋅錠 / ✅ ni-price: 長江鎳價
+//   ❌ al-price: 404（鋁無 h5 頁面）/ ❌ cobalt-price/co-price: 404（鈷無 h5 頁面）
+//   ❌ 所有金屬均無 LME USD 報價（Zn/Ni/Co USD 無免費數據源）
+// ⚠️ vchange_rate 為小數格式，×100 轉百分比
+
+async function fetchSmmCrossCheck() {
+  const SMM_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Referer': 'https://www.smm.cn/',
+  };
+
+  // 遞歸提取所有含 product_name 的條目
+  function walkItems(obj) {
+    const items = [];
+    function walk(o) {
+      if (!o || typeof o !== 'object') return;
+      if (o.product_name !== undefined && o.average != null) {
+        items.push(o); return;
+      }
+      if (Array.isArray(o)) { o.forEach(walk); return; }
+      Object.values(o).forEach(walk);
+    }
+    walk(obj);
+    return items;
+  }
+
+  async function fetchSmm(slug, targetName) {
+    try {
+      const res = await fetch(`https://hq.smm.cn/h5/${slug}`, {
+        headers: SMM_HEADERS, signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const html = await res.text();
+      const nd = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+      if (!nd) throw new Error('no __NEXT_DATA__');
+      const json = JSON.parse(nd[1]);
+      const items = walkItems(json?.props?.pageProps?.datas);
+      const match = items.find(i => i.product_name && i.product_name.includes(targetName));
+      if (!match) throw new Error(`"${targetName}" not found in ${items.length} items`);
+      return {
+        average: match.average,
+        high: match.high,
+        low: match.low,
+        change: match.vchange,
+        changePct: match.vchange_rate != null ? +(match.vchange_rate * 100).toFixed(4) : null,
+        unit: match.unit,
+        dataDate: match.renew_date,
+        productName: match.product_name,
+        source: `SMM/${slug}`,
+      };
+    } catch(err) {
+      process.stderr.write(`[fetch-all-data] SMM cross-check ${slug} 失敗: ${err.message}\n`);
+      return null;
+    }
+  }
+
+  const [cu, zn, ni] = await Promise.all([
+    fetchSmm('cu-price', '\u957f\u6c5f\u73b0\u8d27\u94dc\u4ef7'),       // 长江现货铜价  铜=94DC
+    fetchSmm('zn-price', '\u4e0a\u6d77\u73b0\u8d27\u950c\u952d\u4ef7\u683c0#'), // 上海现货锌锭价格0#  锌=950C 锭=952D
+    fetchSmm('ni-price', '\u957f\u6c5f\u954d\u4ef7\u683c'),             // 长江镍价格  镍=954D
+  ]);
+
+  process.stderr.write(`[fetch-all-data] SMM交叉驗證: Cu=${cu?.average} Zn=${zn?.average} Ni=${ni?.average}\n`);
+  return { copper: cu, zinc: zn, nickel: ni };
+}
+
+// ────────────────────────────────────────────
+// 3c. 通用 fetchSmmMetal（v8 新增）
+// 適用於任何有 __NEXT_DATA__ 的 SMM h5 頁面
+// ────────────────────────────────────────────
+
+async function fetchSmmMetal(slug, targetName) {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Referer': 'https://www.smm.cn/',
+  };
+  try {
+    const res = await fetch(`https://hq.smm.cn/h5/${slug}`, {
+      headers, signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = await res.text();
+    const nd = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (!nd) throw new Error('no __NEXT_DATA__');
+    const json = JSON.parse(nd[1]);
+
+    // 展開所有 data 條目
+    const items = [];
+    function walk(o) {
+      if (!o || typeof o !== 'object') return;
+      if (o.product_name !== undefined && o.average != null) { items.push(o); return; }
+      if (Array.isArray(o)) { o.forEach(walk); return; }
+      Object.values(o).forEach(walk);
+    }
+    walk(json?.props?.pageProps?.datas);
+
+    const match = items.find(i => i.product_name && i.product_name.includes(targetName));
+    if (!match) throw new Error(`"${targetName}" not found in ${items.length} items`);
+
+    const changePct = match.vchange_rate != null ? +(match.vchange_rate * 100).toFixed(3) : null;
+    return {
+      average: match.average,
+      high: match.high,
+      low: match.low,
+      change: match.vchange,
+      changePct,
+      unit: match.unit,
+      dataDate: match.renew_date,
+      productName: match.product_name,
+      source: `SMM/hq.smm.cn/${slug}`,
+    };
+  } catch (err) {
+    process.stderr.write(`[fetch-all-data] fetchSmmMetal(${slug}) 失敗: ${err.message}\n`);
+    return null;
+  }
+}
+
+// 交叉驗證說明生成器
+function buildCrossCheckNote(ccmnPrice, smmPrice, smmLabel) {
+  if (!ccmnPrice || !smmPrice) return null;
+  const diffPct = +((smmPrice - ccmnPrice) / ccmnPrice * 100).toFixed(2);
+  const sign = diffPct >= 0 ? '+' : '';
+  const absDiff = Math.abs(diffPct);
+  if (absDiff < 0.5) return `雙源一致：CCMN ¥${ccmnPrice} vs ${smmLabel} ¥${smmPrice} (${sign}${diffPct}%)`;
+  if (absDiff > 1)   return `差異>1%：CCMN ¥${ccmnPrice} vs ${smmLabel} ¥${smmPrice} (${sign}${diffPct}%)`;
+  return `差異<1%：CCMN ¥${ccmnPrice} vs ${smmLabel} ¥${smmPrice} (${sign}${diffPct}%)`;
 }
 
 // ────────────────────────────────────────────
@@ -641,7 +778,7 @@ async function main() {
 
   process.stderr.write(`[fetch-all-data] 遠期合約: 近月=${sym2}, 遠月=${sym6}\n`);
 
-  // 並行抓取所有數據（v7 新增 metalIndices）
+  // 並行抓取所有數據（v8 新增 smmLead/smmTin + CCMN 鋁）
   const [
     ccmn,
     copperSpot,
@@ -650,6 +787,9 @@ async function main() {
     fwdNear,
     fwdFar,
     bismuth,
+    smmCross,
+    smmLead,
+    smmTin,
     inventory,
     news,
     ibNews,
@@ -660,10 +800,13 @@ async function main() {
     fetchCcmnPrices(),
     fetchYahoo('HG=F'),
     fetchYahoo('ZNC=F'),
-    fetchYahoo('ALI=F'),          // 鋁現貨 USD/t
+    fetchYahoo('ALI=F'),          // 鋁現貨 USD/t（CNY 嘗試從 CCMN A00鋁獲取）
     fetchYahoo(sym2),
     fetchYahoo(sym6),
-    fetchSmmBismuth(),             // 鉍：SMM h5 頁面實時數據
+    fetchSmmBismuth(),             // 鉍：SMM h5 __NEXT_DATA__（含 CNY + CIF USD）
+    fetchSmmCrossCheck(),          // SMM 長江報價交叉驗證（Cu/Zn/Ni）
+    fetchSmmMetal('pb-price', '长江现货铅锭价格'),   // v8 新增：鉛 CNY
+    fetchSmmMetal('sn-price', '长江锡锭价格'),       // v8 新增：錫 CNY
     fetchLmeInventory(),
     fetchNews(),
     fetchIbNews(),
@@ -770,19 +913,71 @@ async function main() {
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   process.stderr.write(`[fetch-all-data] 完成，耗時 ${elapsed}s\n`);
 
+  // 計算交叉驗證差異
+  const crossCheckDiff = (ccmnVal, smmVal) => {
+    if (ccmnVal == null || smmVal == null) return null;
+    return +((Math.abs(ccmnVal - smmVal) / ccmnVal * 100).toFixed(3));
+  };
+
   const output = {
     date: todaySH,
-    dataDate,                                            // 升級一
-    isMarketOpen,                                        // 升級一
-    marketNote,                                          // 升級一
+    dataDate,
+    isMarketOpen,
+    marketNote,
     changeNote: '所有漲跌均為日環比（vs 前一交易日收盤）',
     prices,
     forwards,
-    indices: metalIndices,                               // v7 新增：有色行業指數
+    indices: metalIndices,
     inventory,
+    // SMM 長江報價交叉驗證（與 CCMN 對比，差異 <1% 為正常市場誤差）
+    smmCrossCheck: {
+      copper: smmCross?.copper ? {
+        smmAvg: smmCross.copper.average,
+        smmChange: smmCross.copper.change,
+        smmChangePct: smmCross.copper.changePct,
+        ccmnAvg: ccmn?.copper?.price ?? null,
+        diffPct: crossCheckDiff(ccmn?.copper?.price, smmCross.copper.average),
+        consistent: crossCheckDiff(ccmn?.copper?.price, smmCross.copper.average) != null
+          ? crossCheckDiff(ccmn?.copper?.price, smmCross.copper.average) < 1
+          : null,
+        note: smmCross.copper.productName,
+      } : null,
+      zinc: smmCross?.zinc ? {
+        smmAvg: smmCross.zinc.average,
+        smmChange: smmCross.zinc.change,
+        smmChangePct: smmCross.zinc.changePct,
+        ccmnAvg: ccmn?.zinc?.price ?? null,
+        diffPct: crossCheckDiff(ccmn?.zinc?.price, smmCross.zinc.average),
+        consistent: crossCheckDiff(ccmn?.zinc?.price, smmCross.zinc.average) != null
+          ? crossCheckDiff(ccmn?.zinc?.price, smmCross.zinc.average) < 1
+          : null,
+        note: smmCross.zinc.productName,
+      } : null,
+      nickel: smmCross?.nickel ? {
+        smmAvg: smmCross.nickel.average,
+        smmChange: smmCross.nickel.change,
+        smmChangePct: smmCross.nickel.changePct,
+        ccmnAvg: ccmn?.nickel?.price ?? null,
+        diffPct: crossCheckDiff(ccmn?.nickel?.price, smmCross.nickel.average),
+        consistent: crossCheckDiff(ccmn?.nickel?.price, smmCross.nickel.average) != null
+          ? crossCheckDiff(ccmn?.nickel?.price, smmCross.nickel.average) < 1
+          : null,
+        note: smmCross.nickel.productName,
+      } : null,
+    },
+    // 數據可用性說明（供分析師了解數據缺口）
+    dataAvailability: {
+      copper:  { usd: 'Yahoo HG=F ✅', cny: 'CCMN ✅ / SMM長江✅（交叉驗證）' },
+      zinc:    { usd: '❌ 無免費源（ZNC=F prevClose過期作廢；SMM無USD報價）', cny: 'CCMN ✅ / SMM上海✅' },
+      aluminum:{ usd: 'Yahoo ALI=F ✅', cny: '❌ 無免費源（SMM al-price 404；CCMN A00鋁未採集）' },
+      nickel:  { usd: '❌ 無免費源（SMM無USD；LME被Cloudflare封）', cny: 'CCMN ✅ / SMM長江✅' },
+      cobalt:  { usd: '❌ 無免費源（鈷不在LME標準合約；SMM cobalt-price 404）', cny: 'CCMN ✅' },
+      bismuth: { usd: 'SMM CIF ✅（USD/kg×1000）', cny: 'SMM精鉍 ✅' },
+      lmeInventory: '❌ Cloudflare全面封鎖（全部HTTP 403）',
+    },
     news,
-    ibNews,                                              // 升級三
-    forumSentiment,                                      // v4 新增
+    ibNews,
+    forumSentiment,
   };
 
   console.log(JSON.stringify(output, null, 2));
