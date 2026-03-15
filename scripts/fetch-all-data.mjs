@@ -134,11 +134,12 @@ async function fetchYahoo(symbol) {
 
 // ────────────────────────────────────────────
 // 3. Stooq 鉍現貨（BI.F, USD/t）
+// v5: 加入數據過期校驗（>30天=stale）+ 低價可靠性警告
 // ────────────────────────────────────────────
 
 async function fetchStooqBismuth() {
   // BI.F 單位與 AL.F 相同 = USD/t（metric ton）
-  // 驗證：AL.F = 3383.25, Yahoo ALI=F = 3423.25，非常接近，確認 Stooq 金屬期貨用 USD/t
+  // 注意：Stooq BI.F 報價約 $2,272/t，市場均價約 $6,600-13,200/t，差距較大
   const url = 'https://stooq.com/q/l/?s=BI.F&f=sd2t2ohlcv&h&e=csv';
   try {
     const res = await fetch(url, {
@@ -156,14 +157,40 @@ async function fetchStooqBismuth() {
     if (obj['Close'] === 'N/D' || !obj['Close']) throw new Error('N/D');
     const price = parseFloat(obj['Close']);
     if (isNaN(price)) throw new Error('Invalid');
-    // Stooq CSV 無前日收盤，無法計算 changePct
-    return {
+
+    // 校驗數據日期是否過期（>30 天視為 stale）
+    const dataDate = obj['Date'] ?? null;
+    let stale = false;
+    let daysDiff = null;
+    if (dataDate) {
+      daysDiff = (Date.now() - new Date(dataDate).getTime()) / 86400000;
+      stale = daysDiff > 30;
+    }
+
+    if (stale) {
+      process.stderr.write(`[fetch-all-data] Stooq BI.F 數據過期 ${Math.floor(daysDiff)}d，標記 stale\n`);
+      return {
+        price: null,
+        unit: 'USD/t',
+        exchange: 'Stooq',
+        date: dataDate,
+        changePct: null,
+        staleNote: 'Stooq BI.F 數據過期，不可用',
+      };
+    }
+
+    // 數據是最新的，但價格低於市場均價（$6,600-13,200/t），加可靠性警告
+    const result = {
       price: +price.toFixed(2),
       unit: 'USD/t',
       exchange: 'Stooq',
-      date: obj['Date'],
+      date: dataDate,
       changePct: null,
     };
+    if (price < 6000) {
+      result.reliabilityNote = 'Stooq BI.F 報價低於市場均價（$6,600-13,200/t），可靠性存疑';
+    }
+    return result;
   } catch (err) {
     process.stderr.write(`[fetch-all-data] Stooq BI.F 錯誤: ${err.message}\n`);
     return null;
@@ -329,13 +356,20 @@ async function fetchNews() {
 
 // ────────────────────────────────────────────
 // 6. 投行分析新聞（ibNews）
+// v5: 改為基本金屬雙重過濾（投行名字 AND 基本金屬關鍵詞）
 // ────────────────────────────────────────────
 
 async function fetchIbNews() {
   const queries = [
-    'Goldman+Sachs+JPMorgan+Citi+copper+nickel+metals+forecast',
-    'bank+metals+copper+nickel+outlook+2026',
+    'Goldman+Sachs+JPMorgan+Citi+copper+nickel+zinc+outlook',
+    'copper+nickel+zinc+cobalt+forecast+bank+2026',
+    'base+metals+copper+nickel+Goldman+JPMorgan+forecast',
   ];
+
+  const ibKeywords = ['Goldman', 'JPMorgan', 'Citi', 'Morgan Stanley', 'Bank of America', 'UBS', 'HSBC', 'Barclays', 'BNP', 'Deutsche'];
+  const metalKeywords = ['copper', 'nickel', 'zinc', 'cobalt', 'alumin', 'base metal', 'industrial metal'];
+
+  const allItems = [];
 
   for (const q of queries) {
     try {
@@ -350,17 +384,41 @@ async function fetchIbNews() {
       if (!res.ok) continue;
       const xml = await res.text();
       const items = parseRssItems(xml);
-      const ibKeywords = ['Goldman', 'JPMorgan', 'Citi', 'Morgan Stanley', 'Bank of America', 'UBS', 'HSBC', 'Barclays', 'BNP', 'Deutsche'];
-      const ibItems = items.filter(i => ibKeywords.some(k => i.title.includes(k)));
-      if (ibItems.length > 0) {
-        process.stderr.write(`[fetch-all-data] ibNews 找到 ${ibItems.length} 條投行新聞 (query: ${q})\n`);
-        return ibItems.slice(0, 4);
+
+      // 雙重過濾：同時包含投行名字 AND 基本金屬關鍵詞
+      const doubleFiltered = items.filter(i =>
+        ibKeywords.some(k => i.title.toLowerCase().includes(k.toLowerCase())) &&
+        metalKeywords.some(m => i.title.toLowerCase().includes(m.toLowerCase()))
+      );
+
+      if (doubleFiltered.length > 0) {
+        process.stderr.write(`[fetch-all-data] ibNews 雙重過濾找到 ${doubleFiltered.length} 條基本金屬投行新聞 (query: ${q})\n`);
+        // 合併去重
+        for (const item of doubleFiltered) {
+          if (!allItems.some(x => x.title === item.title)) allItems.push(item);
+        }
+      } else {
+        process.stderr.write(`[fetch-all-data] ibNews 雙重過濾無結果 (query: ${q})，嘗試只過濾金屬關鍵詞\n`);
+        // fallback：只過濾金屬關鍵詞
+        const metalOnly = items.filter(i =>
+          metalKeywords.some(m => i.title.toLowerCase().includes(m.toLowerCase()))
+        );
+        for (const item of metalOnly) {
+          if (!allItems.some(x => x.title === item.title)) {
+            allItems.push({ ...item, source: 'industry_news' });
+          }
+        }
       }
     } catch (err) {
       process.stderr.write(`[fetch-all-data] IB news fetch failed: ${err.message}\n`);
     }
   }
-  process.stderr.write('[fetch-all-data] ibNews 未找到投行標題新聞\n');
+
+  if (allItems.length > 0) {
+    process.stderr.write(`[fetch-all-data] ibNews 最終 ${allItems.length} 條\n`);
+    return allItems.slice(0, 4);
+  }
+  process.stderr.write('[fetch-all-data] ibNews 未找到相關新聞\n');
   return [];
 }
 
@@ -413,16 +471,19 @@ async function fetchSmmNews() {
 }
 
 // ────────────────────────────────────────────
-// v4 新增：8. Reddit r/Commodities 市場情緒
-// 狀態：✅ Reddit JSON API 免費可達
+// v5 更新：8. Reddit 有色金屬相關討論
+// 改為 r/Economics 搜索 copper+metals（v5測試結果：3條有效帖）
+// 測試結果：r/mining(1帖), r/metallurgy(2帖), r/investing(0帖),
+//           r/Economics search(3帖✅), global search(3帖但多為遊戲/藝術)
 // ────────────────────────────────────────────
 
 async function fetchRedditCommodities() {
+  const metalKw = ['copper', 'zinc', 'nickel', 'cobalt', 'base metal', 'base metals', 'industrial metal', 'mining'];
   try {
-    const url = 'https://www.reddit.com/r/Commodities/top.json?t=week&limit=10';
+    const url = 'https://www.reddit.com/r/Economics/search.json?q=copper+metals&sort=top&t=week&limit=10';
     const res = await fetch(url, {
       headers: {
-        'User-Agent': 'MetalPriceBot/4.0 (commodity market research)',
+        'User-Agent': 'MetalPriceBot/5.0 (base metals market research)',
         'Accept': 'application/json',
       },
       signal: AbortSignal.timeout(8000),
@@ -439,9 +500,11 @@ async function fetchRedditCommodities() {
         url: `https://reddit.com${p.data.permalink}`,
         selftext: (p.data.selftext || '').slice(0, 200),
       }))
+      // 只保留包含金屬關鍵詞的帖子
+      .filter(p => metalKw.some(k => p.title.toLowerCase().includes(k)))
       .slice(0, 5);
 
-    process.stderr.write(`[fetch-all-data] Reddit/Commodities: 提取 ${items.length} 帖\n`);
+    process.stderr.write(`[fetch-all-data] Reddit/Economics search: 提取 ${items.length} 有效帖\n`);
     return items;
   } catch (err) {
     process.stderr.write(`[fetch-all-data] Reddit抓取失敗: ${err.message}\n`);
@@ -571,6 +634,7 @@ async function main() {
       cnyChange: ccmn?.cobalt?.updown ?? null,
     },
     // 鉍（Bi）— 來自 Stooq BI.F，USD/t
+    // v5: 加入 staleNote / reliabilityNote 校驗字段
     bismuth: {
       usd: bismuth?.price ?? null,
       usdChangePct: bismuth?.changePct ?? null,  // Stooq CSV 無前日收盤，暫為 null
@@ -578,6 +642,9 @@ async function main() {
       cny: null,
       cnyChange: null,
       source: bismuth ? 'Stooq/BI.F' : null,
+      dataDate: bismuth?.date ?? null,
+      ...(bismuth?.staleNote ? { staleNote: bismuth.staleNote } : {}),
+      ...(bismuth?.reliabilityNote ? { reliabilityNote: bismuth.reliabilityNote } : {}),
     },
   };
 
