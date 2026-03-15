@@ -133,6 +133,42 @@ async function fetchYahoo(symbol) {
 }
 
 // ────────────────────────────────────────────
+// v7 新增：有色金屬行業指數（Yahoo Finance）
+// 測試結果（2026-03-15）：
+//   ^LMEX ⚠️ 過舊（2019）| JJM ⚠️ 過舊（2023）
+//   XME ✅ | COPX ✅ | PICK ✅ | 000812.SS ✅
+//   512400 ❌404 | 159163 ❌404
+// 選定：XME（廣泛礦業） + COPX（銅礦股） + 000812.SS（申萬A股）
+// ────────────────────────────────────────────
+
+async function fetchMetalIndices() {
+  const symbols = [
+    { symbol: 'XME',       name: 'SPDR S&P Metals & Mining ETF',   market: 'US', currency: 'USD' },
+    { symbol: 'COPX',      name: 'Global X Copper Miners ETF',      market: 'US', currency: 'USD' },
+    { symbol: '000812.SS', name: '申萬有色金屬指數',                 market: 'CN', currency: 'CNY' },
+  ];
+
+  const results = await Promise.all(symbols.map(async ({ symbol, name, market, currency }) => {
+    const data = await fetchYahoo(symbol);
+    if (!data.ok || data.price === null) return null;
+    const changeAbs = (data.price != null && data.changePct != null)
+      ? +(data.price * data.changePct / (100 + data.changePct)).toFixed(3)
+      : null;
+    return {
+      symbol,
+      name,
+      market,
+      currency,
+      price: data.price,
+      changePct: data.changePct,
+      changeAbs,
+    };
+  }));
+
+  return results.filter(Boolean);
+}
+
+// ────────────────────────────────────────────
 // 3. Stooq 鉍現貨（BI.F, USD/t）
 // v5: 加入數據過期校驗（>30天=stale）+ 低價可靠性警告
 // ────────────────────────────────────────────
@@ -594,7 +630,7 @@ async function main() {
 
   process.stderr.write(`[fetch-all-data] 遠期合約: 近月=${sym2}, 遠月=${sym6}\n`);
 
-  // 並行抓取所有數據（v4 新增 smmNews + redditCommodities）
+  // 並行抓取所有數據（v7 新增 metalIndices）
   const [
     ccmn,
     copperSpot,
@@ -608,6 +644,7 @@ async function main() {
     ibNews,
     smmNews,
     redditPosts,
+    metalIndices,
   ] = await Promise.all([
     fetchCcmnPrices(),
     fetchYahoo('HG=F'),
@@ -621,6 +658,7 @@ async function main() {
     fetchIbNews(),
     fetchSmmNews(),                // v4 新增：SMM快訊
     fetchRedditCommodities(),      // v4 新增：Reddit情緒
+    fetchMetalIndices(),           // v7 新增：有色行業指數
   ]);
 
   // 升級一：dataDate / isMarketOpen / marketNote
@@ -721,6 +759,7 @@ async function main() {
     changeNote: '所有漲跌均為日環比（vs 前一交易日收盤）',
     prices,
     forwards,
+    indices: metalIndices,                               // v7 新增：有色行業指數
     inventory,
     news,
     ibNews,                                              // 升級三
@@ -741,6 +780,7 @@ main().catch(err => {
     changeNote: '所有漲跌均為日環比（vs 前一交易日收盤）',
     prices: { copper: null, zinc: null, aluminum: null, nickel: null, cobalt: null, bismuth: null },
     forwards: { copper: null },
+    indices: [],
     inventory: { copper: null, zinc: null, nickel: null, cobalt: null, note: err.message },
     news: [],
     ibNews: [],
