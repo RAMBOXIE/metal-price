@@ -478,34 +478,63 @@ async function fetchSmmNews() {
 // ────────────────────────────────────────────
 
 async function fetchRedditCommodities() {
-  const metalKw = ['copper', 'zinc', 'nickel', 'cobalt', 'base metal', 'base metals', 'industrial metal', 'mining'];
-  try {
-    const url = 'https://www.reddit.com/r/Economics/search.json?q=copper+metals&sort=top&t=week&limit=10';
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'MetalPriceBot/5.0 (base metals market research)',
-        'Accept': 'application/json',
-      },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+  const metalKw = ['copper', 'nickel', 'zinc', 'cobalt', 'alumin', 'lead', 'tin',
+                   'base metal', 'industrial metal', 'non-ferrous', 'lme', 'comex',
+                   'mining', 'ore', 'smelter', 'refinery'];
 
-    const posts = data?.data?.children ?? [];
-    const items = posts
+  try {
+    // 並行抓取 top（本週）和 hot（當前）
+    const [topRes, hotRes] = await Promise.all([
+      fetch('https://www.reddit.com/r/Commodities/top.json?t=week&limit=25', {
+        headers: { 'User-Agent': 'MetalPriceBot/5.0 (non-ferrous metals research)' },
+        signal: AbortSignal.timeout(8000),
+      }),
+      fetch('https://www.reddit.com/r/Commodities/hot.json?limit=25', {
+        headers: { 'User-Agent': 'MetalPriceBot/5.0 (non-ferrous metals research)' },
+        signal: AbortSignal.timeout(8000),
+      }),
+    ]);
+
+    const topData = topRes.ok ? await topRes.json() : { data: { children: [] } };
+    const hotData = hotRes.ok ? await hotRes.json() : { data: { children: [] } };
+
+    const parsePosts = (data) => (data?.data?.children ?? [])
       .filter(p => p?.data?.title)
       .map(p => ({
+        id: p.data.id,
         title: p.data.title,
         score: p.data.score || 0,
         url: `https://reddit.com${p.data.permalink}`,
-        selftext: (p.data.selftext || '').slice(0, 200),
-      }))
-      // 只保留包含金屬關鍵詞的帖子
-      .filter(p => metalKw.some(k => p.title.toLowerCase().includes(k)))
-      .slice(0, 5);
+      }));
 
-    process.stderr.write(`[fetch-all-data] Reddit/Economics search: 提取 ${items.length} 有效帖\n`);
-    return items;
+    const topPosts = parsePosts(topData);
+    const hotPosts = parsePosts(hotData);
+
+    // 金屬關鍵詞過濾
+    const isMetalRelated = (title) =>
+      metalKw.some(k => title.toLowerCase().includes(k));
+
+    const metalTop = topPosts.filter(p => isMetalRelated(p.title));
+    const metalHot = hotPosts.filter(p => isMetalRelated(p.title));
+
+    // 找出異動帖（在 hot 榜但不在 top 榜的 id）
+    const topIds = new Set(topPosts.map(p => p.id));
+    const surgingPosts = metalHot.filter(p => !topIds.has(p.id));
+
+    // 組合輸出：金屬相關 top + 異動帖
+    const combined = [
+      ...metalTop.slice(0, 4).map(p => ({ ...p, tag: 'top' })),
+      ...surgingPosts.slice(0, 2).map(p => ({ ...p, tag: 'surging' })),
+    ];
+
+    // 如果完全沒有金屬相關帖子，返回前3條 top 帖（帶 tag: 'general'）供參考
+    const result = combined.length > 0
+      ? combined
+      : topPosts.slice(0, 3).map(p => ({ ...p, tag: 'general_commodities' }));
+
+    const metalCount = metalTop.length + surgingPosts.length;
+    process.stderr.write(`[fetch-all-data] Reddit r/Commodities: top=${topPosts.length}帖, hot=${hotPosts.length}帖, 金屬相關=${metalCount}帖, 異動=${surgingPosts.length}帖\n`);
+    return result;
   } catch (err) {
     process.stderr.write(`[fetch-all-data] Reddit抓取失敗: ${err.message}\n`);
     return [];
@@ -517,22 +546,30 @@ async function fetchRedditCommodities() {
 // ────────────────────────────────────────────
 
 function buildForumSentiment(smmItems, redditItems) {
-  // SMM快訊摘要
   let smmHighlights = null;
   if (smmItems.length > 0) {
     smmHighlights = smmItems.map(i => i.title).join(' | ');
   }
 
-  // Reddit 情緒摘要（提取標題作為英文市場共識）
   let redditSummary = null;
+  let redditSurging = null;
   if (redditItems.length > 0) {
-    redditSummary = redditItems.map(i => `[${i.score}↑] ${i.title}`).join(' | ');
+    const topItems = redditItems.filter(p => p.tag === 'top' || p.tag === 'general_commodities');
+    const surgingItems = redditItems.filter(p => p.tag === 'surging');
+
+    if (topItems.length > 0) {
+      redditSummary = topItems.map(i => `[${i.score}↑] ${i.title}`).join(' | ');
+    }
+    if (surgingItems.length > 0) {
+      redditSurging = surgingItems.map(i => `[異動🔥] ${i.title}`).join(' | ');
+    }
   }
 
   return {
-    smmHighlights,   // SMM快訊中文標題（供AI提取金屬相關信息）
-    redditSummary,   // Reddit r/Commodities 本週熱帖（供AI判斷英語社區情緒）
-    xueqiuSummary: null,  // 雪球需登錄，暫不支持（留位）
+    smmHighlights,
+    redditSummary,    // 金屬相關 top 帖
+    redditSurging,    // 異動帖（hot but not top）
+    xueqiuSummary: null,
     fetchedAt: new Date().toISOString(),
   };
 }
@@ -707,7 +744,7 @@ main().catch(err => {
     inventory: { copper: null, zinc: null, nickel: null, cobalt: null, note: err.message },
     news: [],
     ibNews: [],
-    forumSentiment: { smmHighlights: null, redditSummary: null, xueqiuSummary: null, fetchedAt: new Date().toISOString() },
+    forumSentiment: { smmHighlights: null, redditSummary: null, redditSurging: null, xueqiuSummary: null, fetchedAt: new Date().toISOString() },
     error: err.message,
   }, null, 2));
   process.exit(1);
