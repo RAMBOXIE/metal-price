@@ -825,7 +825,7 @@ async function main() {
     marketNote = `休市：數據截至 ${displayDate}（上個交易日）`;
   }
 
-  // 組裝 prices（升級二：加入 bismuth；升級四：確保欄位語義清晰）
+  // 組裝 prices（v8：CCMN+SMM 交叉驗證 + 鉛/錫新增 + 鋁CNY從CCMN）
   const prices = {
     copper: {
       usd: copperSpot.price,
@@ -833,30 +833,40 @@ async function main() {
       usdUnit: 'USD/lb',
       cny: ccmn?.copper?.price ?? null,
       cnyChange: ccmn?.copper?.updown ?? null,  // 日環比 元/噸
+      // v8 交叉驗證：SMM 長江現貨銅價
+      smmCny: smmCross?.copper?.average ?? null,
+      crossCheckNote: buildCrossCheckNote(ccmn?.copper?.price, smmCross?.copper?.average, 'SMM長江銅'),
     },
     zinc: {
-      usd: zincSpot.ok ? zincSpot.price : null,  // 若 ZNC=F stale (>30天)，ok=false，price=null
-      usdChangePct: null,   // 強制 null，ZNC=F prevClose 不可信（2019年舊數據）
+      usd: null,  // ZNC=F 已廢棄（2019舊數據），SMM 無 LME USD 頁面 → 保持 null
+      usdChangePct: null,
       usdUnit: 'USD/t',
       cny: ccmn?.zinc?.price ?? null,
       cnyChange: ccmn?.zinc?.updown ?? null,
+      // v8 交叉驗證：SMM 上海現貨0#鋅（與 CCMN 廣東市場報價較接近）
+      smmCny: smmCross?.zinc?.average ?? null,
+      crossCheckNote: buildCrossCheckNote(ccmn?.zinc?.price, smmCross?.zinc?.average, 'SMM上海0#鋅'),
     },
     aluminum: {
       usd: alumSpot.ok ? alumSpot.price : null,
       usdChangePct: alumSpot.ok ? alumSpot.changePct : null,
       usdUnit: 'USD/t',
-      cny: null,   // CCMN 有 A00鋁，但非當前重點
-      cnyChange: null,
+      // v8：嘗試從 CCMN 獲取 A00鋁（nameMap 已更新）；SMM 無鋁 h5 頁面（al-price 404）
+      cny: ccmn?.aluminum?.price ?? null,
+      cnyChange: ccmn?.aluminum?.updown ?? null,
     },
     nickel: {
-      usd: null,
+      usd: null,  // SMM 無 LME 鎳 USD 頁面 → 保持 null
       usdChangePct: null,
       usdUnit: 'USD/t',
       cny: ccmn?.nickel?.price ?? null,
       cnyChange: ccmn?.nickel?.updown ?? null,
+      // v8 交叉驗證：SMM 長江鎳價格（電解鎳）
+      smmCny: smmCross?.nickel?.average ?? null,
+      crossCheckNote: buildCrossCheckNote(ccmn?.nickel?.price, smmCross?.nickel?.average, 'SMM電解鎳'),
     },
     cobalt: {
-      usd: null,
+      usd: null,  // SMM 無鈷 h5 頁面（co-price 404）→ 保持 null
       usdChangePct: null,
       usdUnit: 'USD/t',
       cny: ccmn?.cobalt?.price ?? null,
@@ -868,7 +878,7 @@ async function main() {
       cnyHigh: bismuth.cny?.high ?? null,
       cnyLow: bismuth.cny?.low ?? null,
       cnyChange: bismuth.cny?.change ?? null,       // 日環比絕對值 元/噸
-      cnyChangePct: bismuth.cny?.changePct ?? null, // 日環比 %
+      cnyChangePct: bismuth.cny?.changePct ?? null, // 日環比 %（SMM vchange_rate×100）
       cnyUnit: '\u5143/\u5428',
       usd: bismuth.usd?.average ?? null,            // USD/t (CIF)
       usdHigh: bismuth.usd?.high ?? null,
@@ -881,8 +891,32 @@ async function main() {
     } : {
       cny: null, usd: null,
       source: null,
-      note: 'SMM\u9285\u53d6\u5931\u6557\uff0c\u66ab\u7121\u9209\u6578\u64da',
+      note: 'SMM抓取失敗，暫無鉍數據',
     },
+    // v8 新增：鉛（Pb）— SMM pb-price 長江現貨
+    lead: smmLead ? {
+      cny: smmLead.average,
+      cnyHigh: smmLead.high,
+      cnyLow: smmLead.low,
+      cnyChange: smmLead.change,
+      cnyChangePct: smmLead.changePct,
+      cnyUnit: '\u5143/\u5428',
+      usd: null,  // SMM pb-price 無 LME USD 頁面
+      dataDate: smmLead.dataDate,
+      source: smmLead.source,
+    } : { cny: null, usd: null, source: null },
+    // v8 新增：錫（Sn）— SMM sn-price 長江現貨
+    tin: smmTin ? {
+      cny: smmTin.average,
+      cnyHigh: smmTin.high,
+      cnyLow: smmTin.low,
+      cnyChange: smmTin.change,
+      cnyChangePct: smmTin.changePct,
+      cnyUnit: '\u5143/\u5428',
+      usd: null,  // SMM sn-price 無 LME USD 頁面
+      dataDate: smmTin.dataDate,
+      source: smmTin.source,
+    } : { cny: null, usd: null, source: null },
   };
 
   // 組裝 forwards
@@ -992,7 +1026,7 @@ main().catch(err => {
     isMarketOpen: null,
     marketNote: null,
     changeNote: '所有漲跌均為日環比（vs 前一交易日收盤）',
-    prices: { copper: null, zinc: null, aluminum: null, nickel: null, cobalt: null, bismuth: null },
+    prices: { copper: null, zinc: null, aluminum: null, nickel: null, cobalt: null, bismuth: null, lead: null, tin: null },
     forwards: { copper: null },
     indices: [],
     inventory: { copper: null, zinc: null, nickel: null, cobalt: null, note: err.message },
