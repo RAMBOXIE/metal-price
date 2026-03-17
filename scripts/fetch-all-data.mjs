@@ -841,6 +841,115 @@ function buildForumSentiment(smmItems, redditItems) {
 }
 
 // ────────────────────────────────────────────
+// 3d. 鈷（Co）USD 現貨價格
+// 主源：tradingeconomics.com（meta description 嵌入，穩定可靠）
+// 備用：dailymetalprice.com（JSON 數組，USD/lb → USD/t）
+// 測試日期：2026-03-17
+// ────────────────────────────────────────────
+
+async function fetchCobaltUsd() {
+  // === 方案A：tradingeconomics.com meta description ===
+  // 格式："Cobalt traded flat at 56,290 USD/T on March 12, 2026."
+  try {
+    const res = await fetch('https://tradingeconomics.com/commodity/cobalt', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+      },
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = await res.text();
+
+    const metaDesc = html.match(/<meta[^>]+name="description"[^>]+content="([^"]+)"/);
+    if (!metaDesc) throw new Error('meta description not found');
+
+    const priceMatch = metaDesc[1].match(/at\s+([\d,]+)\s*USD\/T/i);
+    if (!priceMatch) throw new Error(`price pattern not found in: ${metaDesc[1].slice(0, 80)}`);
+
+    const price = parseFloat(priceMatch[1].replace(/,/g, ''));
+    if (isNaN(price) || price <= 0) throw new Error(`invalid price: ${priceMatch[1]}`);
+
+    // 提取日期
+    const dateMatch = metaDesc[1].match(/on\s+(\w+)\s+(\d+),\s+(\d{4})/i);
+    let dataDate = null;
+    if (dateMatch) {
+      const monthNames = { January:1,February:2,March:3,April:4,May:5,June:6,
+                           July:7,August:8,September:9,October:10,November:11,December:12 };
+      const m = monthNames[dateMatch[1]];
+      if (m) {
+        dataDate = `${dateMatch[3]}-${String(m).padStart(2,'0')}-${String(parseInt(dateMatch[2])).padStart(2,'0')}`;
+      }
+    }
+
+    process.stderr.write(`[fetch-all-data] 鈷 USD 方案A (TradingEconomics): $${price}/t, date=${dataDate}\n`);
+    return { price, unit: 'USD/t', dataDate, source: 'TradingEconomics' };
+  } catch(err) {
+    process.stderr.write(`[fetch-all-data] 鈷 USD 方案A (TradingEconomics) 失敗: ${err.message}\n`);
+  }
+
+  // === 方案B：dailymetalprice.com JSON array（USD/lb）===
+  // 格式：data = [[timestamp_ms, price_usd_per_lb], ...]
+  try {
+    const res = await fetch('https://www.dailymetalprice.com/metalpricecharts.php?c=co&u=usd&d=5', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,*/*',
+        'Referer': 'https://www.dailymetalprice.com/',
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+
+    // Extract data array: [[timestamp, price], ...]
+    const arrMatch = text.match(/data\s*[=:]\s*(\[\[[\s\S]*?\]\])/);
+    if (!arrMatch) throw new Error('data array not found');
+
+    const arr = JSON.parse(arrMatch[1]);
+    if (!Array.isArray(arr) || arr.length === 0) throw new Error('empty data array');
+
+    // Take the most recent entry (first = latest)
+    const [ts, pricePerLb] = arr[0];
+    if (typeof pricePerLb !== 'number' || pricePerLb <= 0) throw new Error(`invalid price: ${pricePerLb}`);
+
+    // Convert USD/lb → USD/t (1 short ton = 2000 lb, but metal convention uses metric ton = 2204.623 lb)
+    const pricePerTon = Math.round(pricePerLb * 2204.623);
+    const dataDate = new Date(ts).toISOString().slice(0, 10);
+
+    process.stderr.write(`[fetch-all-data] 鈷 USD 方案B (DailyMetalPrice): ${pricePerLb} USD/lb → $${pricePerTon}/t, date=${dataDate}\n`);
+    return { price: pricePerTon, pricePerLb, unit: 'USD/t', dataDate, source: 'DailyMetalPrice' };
+  } catch(err) {
+    process.stderr.write(`[fetch-all-data] 鈷 USD 方案B (DailyMetalPrice) 失敗: ${err.message}\n`);
+  }
+
+  // === 方案C：SMM CNY ÷ USD/CNY 匯率估算 ===
+  // 使用 CCMN 鈷 CNY 價格 + Yahoo Finance USD/CNY 匯率反推
+  try {
+    const fxRes = await fetch('https://query1.finance.yahoo.com/v8/finance/chart/USDCNY=X?interval=1d&range=2d', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!fxRes.ok) throw new Error(`Yahoo FX HTTP ${fxRes.status}`);
+    const fxData = await fxRes.json();
+    const usdcny = fxData?.chart?.result?.[0]?.meta?.regularMarketPrice;
+    if (!usdcny || usdcny <= 0) throw new Error(`invalid USD/CNY: ${usdcny}`);
+    // Will be combined with CCMN cobalt CNY price in main()
+    process.stderr.write(`[fetch-all-data] 鈷 USD 方案C 準備: USD/CNY=${usdcny}\n`);
+    return { price: null, usdcny, unit: 'USD/t', source: 'SMM-CNY/FX-estimate', needsCny: true };
+  } catch(err) {
+    process.stderr.write(`[fetch-all-data] 鈷 USD 方案C (SMM CNY/FX) 失敗: ${err.message}\n`);
+  }
+
+  return null;
+}
+
+// ────────────────────────────────────────────
 // 主函數
 // ────────────────────────────────────────────
 
@@ -860,7 +969,7 @@ async function main() {
 
   process.stderr.write(`[fetch-all-data] 遠期合約: 近月=${sym2}, 遠月=${sym6}\n`);
 
-  // 並行抓取所有數據（v9: Westmetall 庫存+Zn/Ni USD內嵌於 fetchLmeInventory）
+  // 並行抓取所有數據（v10: 新增 fetchCobaltUsd）
   const [
     ccmn,
     copperSpot,
@@ -873,6 +982,7 @@ async function main() {
     smmLead,
     smmTin,
     inventory,
+    cobaltUsdData,
     news,
     ibNews,
     smmNews,
@@ -890,6 +1000,7 @@ async function main() {
     fetchSmmMetal('pb-price', '长江现货铅锭价格'),   // v8 新增：鉛 CNY
     fetchSmmMetal('sn-price', '长江锡锭价格'),       // v8 新增：錫 CNY
     fetchLmeInventory(),           // v9: 方案A 改為 Westmetall，_wmPrices 含 Zn/Ni cashUsd
+    fetchCobaltUsd(),              // v10 新增：鈷 USD 現貨（TradingEconomics / DailyMetalPrice）
     fetchNews(),
     fetchIbNews(),
     fetchSmmNews(),
@@ -952,13 +1063,35 @@ async function main() {
       smmCny: smmCross?.nickel?.average ?? null,
       crossCheckNote: buildCrossCheckNote(ccmn?.nickel?.price, smmCross?.nickel?.average, 'SMM電解鎳'),
     },
-    cobalt: {
-      usd: null,  // SMM 無鈷 h5 頁面（co-price 404）→ 保持 null
-      usdChangePct: null,
-      usdUnit: 'USD/t',
-      cny: ccmn?.cobalt?.price ?? null,
-      cnyChange: ccmn?.cobalt?.updown ?? null,
-    },
+    cobalt: (() => {
+      // v10: 解析 fetchCobaltUsd() 返回值
+      let cobaltUsd = null;
+      let cobaltUsdSource = null;
+      let cobaltUsdDate = null;
+      if (cobaltUsdData) {
+        if (cobaltUsdData.needsCny && cobaltUsdData.usdcny) {
+          // 方案C：SMM CNY ÷ FX 估算
+          const cnyCobalt = ccmn?.cobalt?.price;
+          if (cnyCobalt && cnyCobalt > 0) {
+            cobaltUsd = Math.round(cnyCobalt / cobaltUsdData.usdcny);
+            cobaltUsdSource = 'SMM-CNY/FX-estimate';
+          }
+        } else if (cobaltUsdData.price) {
+          cobaltUsd = cobaltUsdData.price;
+          cobaltUsdSource = cobaltUsdData.source;
+          cobaltUsdDate = cobaltUsdData.dataDate;
+        }
+      }
+      return {
+        usd: cobaltUsd,
+        usdChangePct: null,
+        usdUnit: 'USD/t',
+        usdDataDate: cobaltUsdDate,
+        usdSource: cobaltUsdSource,
+        cny: ccmn?.cobalt?.price ?? null,
+        cnyChange: ccmn?.cobalt?.updown ?? null,
+      };
+    })(),
     // 鉍（Bi）— SMM 上海有色網實時數據
     bismuth: bismuth ? {
       cny: bismuth.cny?.average ?? null,
@@ -1092,7 +1225,14 @@ async function main() {
       zinc:    { usd: westmetall?.zinc?.cashUsd ? `Westmetall LME Cash ✅ $${westmetall.zinc.cashUsd}/t` : '❌ Westmetall抓取失敗', cny: 'CCMN ✅ / SMM上海0#✅（交叉驗證）' },
       aluminum:{ usd: 'Yahoo ALI=F ✅', cny: ccmn?.aluminum?.price ? 'CCMN A00鋁 ✅' : '❌ CCMN無A00鋁數據（可能休市）' },
       nickel:  { usd: westmetall?.nickel?.cashUsd ? `Westmetall LME Cash ✅ $${westmetall.nickel.cashUsd}/t` : '❌ Westmetall抓取失敗', cny: 'CCMN ✅ / SMM電解鎳✅（交叉驗證）' },
-      cobalt:  { usd: '❌ 無免費源（Westmetall無Co；LME Co非主流合約）', cny: 'CCMN ✅' },
+      cobalt:  {
+        usd: cobaltUsdData?.price
+          ? `${cobaltUsdData.source} ✅ $${cobaltUsdData.price}/t (${cobaltUsdData.dataDate})`
+          : cobaltUsdData?.needsCny
+            ? `SMM-CNY/FX-estimate ✅（估算）`
+            : '❌ 所有源失敗',
+        cny: 'CCMN ✅',
+      },
       bismuth: { usd: 'SMM CIF ✅（精鉍USD/kg×1000）', cny: 'SMM精鉍 ✅' },
       lead:    { usd: '❌ 無免費源', cny: smmLead ? 'SMM長江鉛錠 ✅（v8新增）' : '❌ SMM抓取失敗' },
       tin:     { usd: '❌ 無免費源', cny: smmTin  ? 'SMM長江錫錠 ✅（v8新增）' : '❌ SMM抓取失敗' },
