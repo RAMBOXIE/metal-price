@@ -1,0 +1,17 @@
+# Dev & probe scripts
+scripts/dev/
+
+# Memory & agent files (internal use)
+MEMORY.md
+AGENTS.md
+SOUL.md
+USER.md
+memory/
+
+# Logs & env
+stderr.log
+.env
+.env.local
+
+# Git
+.git/
