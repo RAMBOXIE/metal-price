@@ -78,6 +78,83 @@ async function fetchCcmnPrices() {
 }
 
 // ────────────────────────────────────────────
+// 1b. OmetalCN 長江現貨（GBK 頁面，備用源）
+// URL: http://app.ometal.cn/data/mlist.asp
+// 品種：Cu / Al / Pb / Zn / Ni / Sn + 升貼水
+// 優勢：有 A00鋁（CCMN 常缺）、解析穩定、響應快
+// ────────────────────────────────────────────
+
+async function fetchOmetal() {
+  try {
+    const res = await fetch('http://app.ometal.cn/data/mlist.asp', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html',
+        'Referer': 'http://app.ometal.cn/',
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buf = await res.arrayBuffer();
+    const text = new TextDecoder('gbk').decode(buf);
+
+    // 提取純文字（去除HTML標籤）
+    const plain = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+
+    // 解析價格表格：格式為「品名 高-低 均價 ↑↓變動 更多」
+    function parseRow(name) {
+      // 匹配：品名後面跟數字區間、均價、漲跌
+      const re = new RegExp(
+        name.replace(/[#()]/g, c => '\\' + c) +
+        '\\s+([\\d,]+-[\\d,-]+)\\s+([\\d,]+)\\s+[↑↓]([\\-\\d,]+)'
+      );
+      const m = plain.match(re);
+      if (!m) return null;
+      const range = m[1].split('-');
+      const avg = parseFloat(m[2].replace(/,/g, ''));
+      const change = parseFloat(m[3].replace(/,/g, ''));
+      // range: 有時是「22850-22950」也有負數「-130--90」
+      let low = null, high = null;
+      if (range.length === 2) {
+        low  = parseFloat(range[0].replace(/,/g, ''));
+        high = parseFloat(range[1].replace(/,/g, ''));
+      }
+      if (isNaN(avg)) return null;
+      return { price: avg, high: isNaN(high) ? null : high, low: isNaN(low) ? null : low, change: isNaN(change) ? null : change };
+    }
+
+    // 提取日期（格式：日期: 3/26）
+    const dateMatch = plain.match(/日期[：:]\s*(\d+)\/(\d+)/);
+    let dataDate = null;
+    if (dateMatch) {
+      const year = new Date().getFullYear();
+      dataDate = `${year}-${String(parseInt(dateMatch[1])).padStart(2,'0')}-${String(parseInt(dateMatch[2])).padStart(2,'0')}`;
+    }
+
+    const result = {
+      copper:          parseRow('1#铜'),
+      aluminum:        parseRow('A00铝'),
+      lead:            parseRow('1#铅'),
+      zinc:            parseRow('0#锌'),
+      nickel:          parseRow('1#镍板'),
+      tin:             parseRow('1#锡'),
+      copperPremium:   parseRow('铜升贴水'),
+      aluminumPremium: parseRow('铝升贴水'),
+      dataDate,
+      source: 'OmetalCN/app.ometal.cn',
+    };
+
+    process.stderr.write(
+      `[fetch-all-data] OmetalCN: Cu=¥${result.copper?.price} Al=¥${result.aluminum?.price} Zn=¥${result.zinc?.price} Ni=¥${result.nickel?.price} Sn=¥${result.tin?.price}\n`
+    );
+    return result;
+  } catch (err) {
+    process.stderr.write(`[fetch-all-data] OmetalCN 失敗: ${err.message}\n`);
+    return null;
+  }
+}
+
+// ────────────────────────────────────────────
 // 2. Yahoo Finance v8（USD 現貨 / 遠期合約）
 // ────────────────────────────────────────────
 
@@ -982,6 +1059,7 @@ async function main() {
   // 並行抓取所有數據（v10: 新增 fetchCobaltUsd）
   const [
     ccmn,
+    ometal,
     copperSpot,
     zincSpot,
     alumSpot,
@@ -1000,17 +1078,18 @@ async function main() {
     metalIndices,
   ] = await Promise.all([
     fetchCcmnPrices(),
+    fetchOmetal(),                 // v11 新增：OmetalCN 備用源（Cu/Al/Pb/Zn/Ni/Sn）
     fetchYahoo('HG=F'),
     fetchYahoo('ZNC=F'),
-    fetchYahoo('ALI=F'),          // 鋁現貨 USD/t（CNY 嘗試從 CCMN A00鋁獲取）
+    fetchYahoo('ALI=F'),          // 鋁現貨 USD/t
     fetchYahoo(sym2),
     fetchYahoo(sym6),
     fetchSmmBismuth(),             // 鉍：SMM h5 __NEXT_DATA__（含 CNY + CIF USD）
     fetchSmmCrossCheck(),          // SMM 長江報價交叉驗證（Cu/Zn/Ni）
-    fetchSmmMetal('pb-price', '长江现货铅锭价格'),   // v8 新增：鉛 CNY
-    fetchSmmMetal('sn-price', '长江锡锭价格'),       // v8 新增：錫 CNY
-    fetchLmeInventory(),           // v9: 方案A 改為 Westmetall，_wmPrices 含 Zn/Ni cashUsd
-    fetchCobaltUsd(),              // v10 新增：鈷 USD 現貨（TradingEconomics / DailyMetalPrice）
+    fetchSmmMetal('pb-price', '长江现货铅锭价格'),   // 鉛 CNY
+    fetchSmmMetal('sn-price', '长江锡锭价格'),       // 錫 CNY
+    fetchLmeInventory(),           // Westmetall LME 庫存 + Zn/Ni USD
+    fetchCobaltUsd(),              // 鈷 USD 現貨（TradingEconomics / DailyMetalPrice）
     fetchNews(),
     fetchIbNews(),
     fetchSmmNews(),
@@ -1058,9 +1137,10 @@ async function main() {
       usd: alumSpot.ok ? alumSpot.price : null,
       usdChangePct: alumSpot.ok ? alumSpot.changePct : null,
       usdUnit: 'USD/t',
-      // v8：嘗試從 CCMN 獲取 A00鋁（nameMap 已更新）；SMM 無鋁 h5 頁面（al-price 404）
-      cny: ccmn?.aluminum?.price ?? null,
-      cnyChange: ccmn?.aluminum?.updown ?? null,
+      // v11: 優先 CCMN A00鋁 → 備用 OmetalCN A00鋁（SMM 無鋁 h5 頁面）
+      cny: ccmn?.aluminum?.price ?? ometal?.aluminum?.price ?? null,
+      cnyChange: ccmn?.aluminum?.updown ?? ometal?.aluminum?.change ?? null,
+      cnySource: ccmn?.aluminum?.price != null ? 'CCMN' : (ometal?.aluminum?.price != null ? 'OmetalCN' : null),
     },
     nickel: {
       // v9: 從 Westmetall LME Cash-Settlement 獲取 USD 現貨
@@ -1233,7 +1313,7 @@ async function main() {
     dataAvailability: {
       copper:  { usd: 'Yahoo HG=F ✅', cny: 'CCMN ✅ / SMM長江✅（交叉驗證）' },
       zinc:    { usd: westmetall?.zinc?.cashUsd ? `Westmetall LME Cash ✅ $${westmetall.zinc.cashUsd}/t` : '❌ Westmetall抓取失敗', cny: 'CCMN ✅ / SMM上海0#✅（交叉驗證）' },
-      aluminum:{ usd: 'Yahoo ALI=F ✅', cny: ccmn?.aluminum?.price ? 'CCMN A00鋁 ✅' : '❌ CCMN無A00鋁數據（可能休市）' },
+      aluminum:{ usd: 'Yahoo ALI=F ✅', cny: ccmn?.aluminum?.price ? 'CCMN A00鋁 ✅' : (ometal?.aluminum?.price ? 'OmetalCN A00鋁 ✅（備用）' : '❌ 無鋁CNY數據') },
       nickel:  { usd: westmetall?.nickel?.cashUsd ? `Westmetall LME Cash ✅ $${westmetall.nickel.cashUsd}/t` : '❌ Westmetall抓取失敗', cny: 'CCMN ✅ / SMM電解鎳✅（交叉驗證）' },
       cobalt:  {
         usd: cobaltUsdData?.price
