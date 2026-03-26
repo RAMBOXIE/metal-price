@@ -33,7 +33,7 @@ async function fetchCcmnPrices() {
         'X-Requested-With': 'XMLHttpRequest',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       },
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(12000),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
@@ -278,10 +278,10 @@ async function fetchSmmCrossCheck() {
     return items;
   }
 
-  async function fetchSmm(slug, targetName) {
+  async function fetchSmm(slug, targetName, attempt = 1) {
     try {
       const res = await fetch(`https://hq.smm.cn/h5/${slug}`, {
-        headers: SMM_HEADERS, signal: AbortSignal.timeout(8000),
+        headers: SMM_HEADERS, signal: AbortSignal.timeout(12000),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const html = await res.text();
@@ -303,7 +303,12 @@ async function fetchSmmCrossCheck() {
         source: `SMM/${slug}`,
       };
     } catch(err) {
-      process.stderr.write(`[fetch-all-data] SMM cross-check ${slug} 失敗: ${err.message}\n`);
+      if (attempt === 1) {
+        process.stderr.write(`[fetch-all-data] SMM cross-check ${slug} 第一次失敗 (${err.message})，1.5秒後重試...\n`);
+        await new Promise(r => setTimeout(r, 1500));
+        return fetchSmm(slug, targetName, 2);
+      }
+      process.stderr.write(`[fetch-all-data] SMM cross-check ${slug} 最終失敗: ${err.message}\n`);
       return null;
     }
   }
@@ -331,7 +336,7 @@ async function fetchSmmMetal(slug, targetName) {
   };
   try {
     const res = await fetch(`https://hq.smm.cn/h5/${slug}`, {
-      headers, signal: AbortSignal.timeout(8000),
+      headers, signal: AbortSignal.timeout(12000),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const html = await res.text();
@@ -402,7 +407,7 @@ function parseWestmetallDate(str) {
   return `${m[3]}-${mon}-${d}`;
 }
 
-async function fetchWestmetallMetal(fieldName) {
+async function fetchWestmetallMetal(fieldName, attempt = 1) {
   // fieldName: 'LME_Cu_stock' | 'LME_Zn_stock' | 'LME_Ni_stock'
   const url = `https://www.westmetall.com/en/markdaten.php?action=table&field=${fieldName}`;
   try {
@@ -412,7 +417,7 @@ async function fetchWestmetallMetal(fieldName) {
         'Accept': 'text/html',
         'Referer': 'https://www.westmetall.com/en/markdaten.php',
       },
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(15000),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const html = await res.text();
@@ -456,7 +461,12 @@ async function fetchWestmetallMetal(fieldName) {
       source: `Westmetall/${fieldName}`,
     };
   } catch (err) {
-    process.stderr.write(`[fetch-all-data] Westmetall ${fieldName} 錯誤: ${err.message}\n`);
+    if (attempt === 1) {
+      process.stderr.write(`[fetch-all-data] Westmetall ${fieldName} 第一次失敗 (${err.message})，2秒後重試...\n`);
+      await new Promise(r => setTimeout(r, 2000));
+      return fetchWestmetallMetal(fieldName, 2);
+    }
+    process.stderr.write(`[fetch-all-data] Westmetall ${fieldName} 最終失敗: ${err.message}\n`);
     return null;
   }
 }
