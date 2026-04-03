@@ -49,6 +49,7 @@ async function fetchCcmnPrices() {
       '1#钴': 'cobalt',
       'A00铝': 'aluminum',  // v8 新增：嘗試從 CCMN 獲取鋁價
       '1#铝': 'aluminum',   // 備用牌號
+      '1#镁': 'magnesium',  // v12 新增：鎂
     };
 
     // 升級一：提取 dataDate 與 isMarketOpen
@@ -58,7 +59,7 @@ async function fetchCcmnPrices() {
     const todaySH = today();
     const isMarketOpen = dataDate ? (dataDate === todaySH) : null;
 
-    const result = { copper: null, zinc: null, nickel: null, cobalt: null, aluminum: null, dataDate, isMarketOpen };
+    const result = { copper: null, zinc: null, nickel: null, cobalt: null, aluminum: null, magnesium: null, dataDate, isMarketOpen };
     for (const item of list) {
       const key = nameMap[item.productSortName];
       if (key) {
@@ -1203,6 +1204,14 @@ async function main() {
       source: null,
       note: 'SMM抓取失敗，暫無鉍數據',
     },
+    // v12 新增：鎂（Mg）— CCMN 1#鎂
+    magnesium: ccmn?.magnesium ? {
+      cny: ccmn.magnesium.price ?? null,
+      cnyChange: ccmn.magnesium.updown ?? null,
+      cnyUnit: '\u5143/\u5428',
+      usd: null,
+      source: 'CCMN',
+    } : { cny: null, usd: null, source: null },
     // v8 新增：鉛（Pb）— SMM pb-price 長江現貨
     lead: smmLead ? {
       cny: smmLead.average,
@@ -1323,7 +1332,8 @@ async function main() {
             : '❌ 所有源失敗',
         cny: 'CCMN ✅',
       },
-      bismuth: { usd: 'SMM CIF ✅（精鉍USD/kg×1000）', cny: 'SMM精鉍 ✅' },
+      bismuth:   { usd: 'SMM CIF ✅（精鉍USD/kg×1000）', cny: 'SMM精鉍 ✅' },
+      magnesium: { usd: '❌ 無免費USD源', cny: ccmn?.magnesium?.price ? 'CCMN 1#鎂 ✅（v12新增）' : '❌ CCMN無鎂數據' },
       lead:    { usd: '❌ 無免費源', cny: smmLead ? 'SMM長江鉛錠 ✅（v8新增）' : '❌ SMM抓取失敗' },
       tin:     { usd: '❌ 無免費源', cny: smmTin  ? 'SMM長江錫錠 ✅（v8新增）' : '❌ SMM抓取失敗' },
       lmeInventory: westmetall?.copper?.tonnes ? `Westmetall ✅（Cu=${westmetall.copper.tonnes}t, Zn=${westmetall.zinc?.tonnes}t, Ni=${westmetall.nickel?.tonnes}t）` : '❌ Westmetall抓取失敗',
@@ -1345,7 +1355,7 @@ main().catch(err => {
     isMarketOpen: null,
     marketNote: null,
     changeNote: '所有漲跌均為日環比（vs 前一交易日收盤）',
-    prices: { copper: null, zinc: null, aluminum: null, nickel: null, cobalt: null, bismuth: null, lead: null, tin: null },
+    prices: { copper: null, zinc: null, aluminum: null, nickel: null, cobalt: null, bismuth: null, magnesium: null, lead: null, tin: null },
     forwards: { copper: null },
     indices: [],
     inventory: { copper: null, zinc: null, nickel: null, cobalt: null, note: err.message },

@@ -39,7 +39,7 @@ function parseRSS(xml) {
 }
 
 // ────────────────────────────────────────────
-// 過濾金屬相關新聞
+// 過濾金屬相關新聞（關鍵詞匹配）
 // ────────────────────────────────────────────
 function filterMetalNews(items) {
   return items.filter(item => {
@@ -51,6 +51,18 @@ function filterMetalNews(items) {
 // ────────────────────────────────────────────
 // 單個 RSS 源抓取
 // ────────────────────────────────────────────
+// ────────────────────────────────────────────
+// 日期過濾（所有源通用，只保留 36h 內）
+// ────────────────────────────────────────────
+function filterByDate(items) {
+  const cutoff = Date.now() - 36 * 60 * 60 * 1000;
+  return items.filter(item => {
+    if (!item.publishedAt) return true; // 無日期字段不過濾
+    const ts = Date.parse(item.publishedAt);
+    return isNaN(ts) || ts >= cutoff;
+  });
+}
+
 async function fetchRSS(url, needFilter = false) {
   const res = await fetch(url, {
     headers: {
@@ -63,6 +75,7 @@ async function fetchRSS(url, needFilter = false) {
   const xml = await res.text();
   let items = parseRSS(xml);
   if (needFilter) items = filterMetalNews(items);
+  items = filterByDate(items); // 所有源都過濾日期
   return items;
 }
 
