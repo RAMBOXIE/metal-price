@@ -3,7 +3,7 @@
  * 调用 fetch-all-data.mjs，生成六板块有色日报，发送至 Telegram
  */
 
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { execFile } from 'child_process';
@@ -11,6 +11,7 @@ import { promisify } from 'util';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, '..');
+const REPORT_CACHE_PATH = join(PROJECT_ROOT, 'memory', 'daily-report-state.json');
 const execFileAsync = promisify(execFile);
 
 // ────────────────────────────────────────────
@@ -35,6 +36,56 @@ function loadEnv() {
     process.stderr.write('[daily-report] ℹ️  未找到 .env\n');
   }
   return env;
+}
+
+function normText(s) {
+  return (s || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function loadReportState() {
+  try {
+    if (!existsSync(REPORT_CACHE_PATH)) return null;
+    const raw = readFileSync(REPORT_CACHE_PATH, 'utf-8');
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function saveReportState(state) {
+  try {
+    const dir = join(PROJECT_ROOT, 'memory');
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(REPORT_CACHE_PATH, JSON.stringify(state, null, 2), 'utf-8');
+  } catch (err) {
+    process.stderr.write(`[daily-report] ⚠️ 寫入報告狀態失敗: ${err.message}\n`);
+  }
+}
+
+function buildSection7Snapshot(d) {
+  const ibItems = freshNews(d.ibNews || []);
+  const cnNews = freshNews(d.news || []);
+  const forum = d.forumSentiment || {};
+  return {
+    date: d.date,
+    ibTitles: [...new Set(ibItems.map(x => normText(x.title)).filter(Boolean))],
+    cnTitles: [...new Set(cnNews.map(x => normText(x.title)).filter(Boolean))],
+    smmHighlights: normText(forum.smmHighlights),
+    redditSurging: normText(forum.redditSurging),
+  };
+}
+
+function diffSection7(prev, curr) {
+  const prevIb = new Set(prev?.ibTitles || []);
+  const prevCn = new Set(prev?.cnTitles || []);
+  const ibNew = (curr.ibTitles || []).filter(t => !prevIb.has(t));
+  const cnNew = (curr.cnTitles || []).filter(t => !prevCn.has(t));
+  const smmChanged = !!curr.smmHighlights && curr.smmHighlights !== (prev?.smmHighlights || '');
+  const redditChanged = !!curr.redditSurging && curr.redditSurging !== (prev?.redditSurging || '');
+  return { ibNew, cnNew, smmChanged, redditChanged };
 }
 
 // ────────────────────────────────────────────
@@ -73,11 +124,30 @@ function fmtChange(v) {
   return `${sign}${fmtNum(Math.abs(v))}`;
 }
 
+function clamp(text, max = 160) {
+  if (!text) return '';
+  return text.length > max ? text.slice(0, max) + '…' : text;
+}
+
 function emoji(v) {
   if (v == null) return '⚪';
   if (v > 0.1) return '🟢';
   if (v < -0.1) return '🔴';
   return '🔵';
+}
+
+function arrow(v) {
+  if (v == null) return '➖';
+  if (v > 0) return '🔺';
+  if (v < 0) return '🔻';
+  return '➖';
+}
+
+function signScore(v, pos = 0, neg = 0) {
+  if (v == null) return '0';
+  if (v > pos) return '+';
+  if (v < neg) return '-';
+  return '0';
 }
 
 // ────────────────────────────────────────────
@@ -93,14 +163,75 @@ function freshNews(items) {
   });
 }
 
+function buildImportParity(prices, fx) {
+  const fxRate = fx?.price ?? null;
+  const fee = { nickel: 1500, copper: 800, zinc: 500 };
+  const metals = ['nickel', 'copper', 'zinc'];
+  const result = {};
+  for (const m of metals) {
+    const usdRaw = prices?.[m]?.usd ?? null;
+    const unit = prices?.[m]?.usdUnit ?? null;
+    const usdPerTon = unit === 'USD/lb' ? (usdRaw != null ? usdRaw * 2204.62 : null) : usdRaw;
+    const cny = prices?.[m]?.cny ?? null;
+    if (usdPerTon == null || fxRate == null || cny == null) {
+      result[m] = null;
+      continue;
+    }
+    const landed = Math.round(usdPerTon * fxRate + fee[m]);
+    const pnl = cny - landed; // >0 = 內盤升水，進口盈利
+    const status = pnl > 200 ? '盈利' : (pnl < -200 ? '虧損' : '中性');
+    result[m] = { usd: usdPerTon, fx: fxRate, landed, domestic: cny, pnl, status, fee: fee[m] };
+  }
+  return result;
+}
+
+function summarizeScores(scores) {
+  const pos = Object.values(scores).filter(s => s === '+').length;
+  const neg = Object.values(scores).filter(s => s === '-').length;
+  if (pos > neg + 1) return '整體偏多（+）';
+  if (neg > pos + 1) return '整體偏空（-）';
+  return '中性觀望（0）';
+}
+
+function usdToCnyPerTon(usd, unit, fxRate) {
+  if (usd == null || fxRate == null) return null;
+  const usdPerTon = unit === 'USD/lb' ? usd * 2204.62 : usd;
+  return usdPerTon * fxRate;
+}
+
+function fmtCnyPerTonFromUsd(usd, unit, fxRate, withRaw = false) {
+  const cny = usdToCnyPerTon(usd, unit, fxRate);
+  if (cny == null) return null;
+  return withRaw
+    ? `CNY ${fmtNum(cny)}/t（USD ${fmtNum(usd, unit === 'USD/lb' ? 3 : 0)}${unit === 'USD/lb' ? '/lb' : '/t'}）`
+    : `CNY ${fmtNum(cny)}/t`;
+}
+
+function calcBasis(prices, fx, key) {
+  const usdRaw = prices?.[key]?.usd ?? null;
+  const unit = prices?.[key]?.usdUnit ?? null;
+  const usd = unit === 'USD/lb' ? (usdRaw != null ? usdRaw * 2204.62 : null) : usdRaw;
+  const cny = prices?.[key]?.cny ?? null;
+  const rate = fx?.price ?? null;
+  if (usd == null || cny == null || rate == null) return null;
+  const importParity = usd * rate;
+  return cny - importParity; // >0 = 內盤升水
+}
+
 // ────────────────────────────────────────────
 // 组装报告
 // ────────────────────────────────────────────
-function buildReport(d) {
+function buildReport(d, prevState = null) {
   const p = d.prices;
   const inv = d.inventory || {};
   const fwd = d.forwards?.copper;
   const idx = d.indices || [];
+  const fx = d.fxRates?.usdCny || null;
+  const fxRate = fx?.price ?? null;
+  const macro = d.macro || [];
+  const importParity = buildImportParity(p, fx);
+  const section7Snapshot = buildSection7Snapshot(d);
+  const section7Delta = diffSection7(prevState?.section7, section7Snapshot);
   // 目標品種：Cu / Zn / Ni / Co / Mg / Bi（不含 Al）
 
   const lines = [];
@@ -122,7 +253,7 @@ function buildReport(d) {
     const usdDir = cu.usdChangePct;
     const cuEmoji = emoji(usdDir ?? cu.cnyChange);
     let line = `${cuEmoji} 銅（Cu）`;
-    if (cu.usd != null) line += `USD ${fmtNum(cu.usd, 3)}/lb ${fmtPct(cu.usdChangePct)} [COMEX]`;
+    if (cu.usd != null) line += `${fmtCnyPerTonFromUsd(cu.usd, 'USD/lb', fxRate, true) || '—'} ${fmtPct(cu.usdChangePct)} [COMEX]`;
     if (cu.cny != null) line += `  |  CNY ${fmtNum(cu.cny)}/t ${fmtChange(cu.cnyChange)} [長江]`;
     lines.push(line);
   }
@@ -132,7 +263,7 @@ function buildReport(d) {
   if (zn) {
     const znEmoji = emoji(zn.usdChangePct ?? zn.cnyChange);
     let line = `${znEmoji} 鋅（Zn）`;
-    if (zn.usd != null) line += `USD ${fmtNum(zn.usd)}/t ${fmtPct(zn.usdChangePct)} [LME Cash]`;
+    if (zn.usd != null) line += `${fmtCnyPerTonFromUsd(zn.usd, 'USD/t', fxRate, true) || '—'} ${fmtPct(zn.usdChangePct)} [LME Cash]`;
     if (zn.cny != null) line += `  |  CNY ${fmtNum(zn.cny)}/t ${fmtChange(zn.cnyChange)} [長江]`;
     lines.push(line);
   }
@@ -142,7 +273,7 @@ function buildReport(d) {
   if (ni) {
     const niEmoji = emoji(ni.usdChangePct ?? ni.cnyChange);
     let line = `${niEmoji} 鎳（Ni）`;
-    if (ni.usd != null) line += `USD ${fmtNum(ni.usd)}/t ${fmtPct(ni.usdChangePct)} [LME Cash]`;
+    if (ni.usd != null) line += `${fmtCnyPerTonFromUsd(ni.usd, 'USD/t', fxRate, true) || '—'} ${fmtPct(ni.usdChangePct)} [LME Cash]`;
     if (ni.cny != null) line += `  |  CNY ${fmtNum(ni.cny)}/t ${fmtChange(ni.cnyChange)} [長江]`;
     lines.push(line);
   }
@@ -153,7 +284,7 @@ function buildReport(d) {
     const coEmoji = emoji(co.cnyChange);
     let line = `${coEmoji} 鈷（Co）`;
     if (co.usd != null) {
-      line += `USD ${fmtNum(co.usd)}/t`;
+      line += `${fmtCnyPerTonFromUsd(co.usd, 'USD/t', fxRate, true) || '—'}`;
       if (co.usdDataDate && co.usdDataDate !== d.date) line += ` (${co.usdDataDate})`;
     }
     if (co.cny != null) line += `  |  CNY ${fmtNum(co.cny)}/t ${fmtChange(co.cnyChange)} [長江]`;
@@ -165,7 +296,7 @@ function buildReport(d) {
   if (bi) {
     const biEmoji = emoji(bi.cnyChangePct ?? 0);
     let line = `${biEmoji} 鉍（Bi）`;
-    if (bi.usd != null) line += `USD ${fmtNum(bi.usd)}/t`;
+    if (bi.usd != null) line += `${fmtCnyPerTonFromUsd(bi.usd, 'USD/t', fxRate, true) || '—'}`;
     if (bi.cny != null) line += `  |  CNY ${fmtNum(bi.cny)}/t ${fmtChange(bi.cnyChange)} [SMM]`;
     lines.push(line);
   }
@@ -243,103 +374,186 @@ function buildReport(d) {
   }
   lines.push('');
 
-  // ── 四、基本面（库存） ──
-  lines.push('━━━ 四、基本面（LME 庫存） ━━━');
-  if (inv.copper?.tonnes != null) {
-    lines.push(`• 銅：${fmtNum(inv.copper.tonnes)} t ${fmtChange(inv.copper.change)}（${inv.copper.change > 0 ? '累庫，壓制升水' : '去庫，支撐現貨'}）`);
-  }
-  if (inv.zinc?.tonnes != null) {
-    lines.push(`• 鋅：${fmtNum(inv.zinc.tonnes)} t ${fmtChange(inv.zinc.change)}（${inv.zinc.change < 0 ? '去庫，供應偏緊' : '累庫，壓力存在'}）`);
-  }
-  if (inv.nickel?.tonnes != null) {
-    lines.push(`• 鎳：${fmtNum(inv.nickel.tonnes)} t ${fmtChange(inv.nickel.change)}`);
-  }
+  // ── 四、庫存三件套 ──
+  lines.push('━━━ 四、庫存三件套 ━━━');
+  const exchLine = [
+    `Cu ${inv.copper?.tonnes ? fmtNum(inv.copper.tonnes) + 't' : '—'} ${arrow(inv.copper?.change)}${fmtChange(inv.copper?.change)}`,
+    `Zn ${inv.zinc?.tonnes ? fmtNum(inv.zinc.tonnes) + 't' : '—'} ${arrow(inv.zinc?.change)}${fmtChange(inv.zinc?.change)}`,
+    `Ni ${inv.nickel?.tonnes ? fmtNum(inv.nickel.tonnes) + 't' : '—'} ${arrow(inv.nickel?.change)}${fmtChange(inv.nickel?.change)}`,
+  ].join('  |  ');
+  lines.push(`交易所 (LME)：${exchLine}`);
+  lines.push('保稅區：暫缺（待接入，保留欄位不崩）');
+  lines.push('社會庫存：暫缺（待接入，保留欄位不崩）');
   if (inv.copper?.dataDate) {
     lines.push(`_庫存截至 ${inv.copper.dataDate}_`);
   }
   lines.push('');
 
-  // ── 五、市场情绪与机构观点 ──
-  lines.push('━━━ 五、市場情緒與機構觀點 ━━━');
+  // ── 五、進口盈虧 / 到岸成本 ──
+  lines.push('━━━ 五、進口盈虧 / 到岸成本 ━━━');
+  const fxLine = fx?.price ? `USD/CNY ${fx.price.toFixed(4)} ${fmtPct(fx.changePct)}` : 'USD/CNY 暫缺';
+  lines.push(`匯率：${fxLine}；假設含稅費用 Ni ¥1,500 / Cu ¥800 / Zn ¥500`);
+  function importLine(key, label) {
+    const row = importParity[key];
+    if (!row) return `${label}：數據暫缺（外盤或內盤或匯率缺失）`;
+    const pnlEmoji = row.pnl > 200 ? '🟢' : (row.pnl < -200 ? '🔴' : '🔵');
+    return `${pnlEmoji} ${label}：外盤 $${fmtNum(row.usd)}/t → 到岸 ¥${fmtNum(row.landed)}/t（含費¥${fmtNum(row.fee)}） | 內盤 ¥${fmtNum(row.domestic)}/t → 盈虧 ${row.pnl >= 0 ? '+' : ''}${fmtNum(row.pnl)}/t（${row.status}）`;
+  }
+  lines.push(importLine('nickel', '鎳 Ni'));
+  lines.push(importLine('copper', '銅 Cu'));
+  lines.push(importLine('zinc',   '鋅 Zn'));
+  lines.push('');
+
+  // ── 六、信號摘要（+ / 0 / -） ──
+  lines.push('━━━ 六、信號摘要（+ / 0 / -） ━━━');
+  const invChanges = [inv.copper?.change, inv.zinc?.change, inv.nickel?.change].filter(v => v != null);
+  const invDir = invChanges.length ? invChanges.reduce((a, b) => a + b, 0) / invChanges.length : null;
+  const invScore = signScore(invDir != null ? -invDir : null); // 去庫為正
+
+  const basisVals = ['copper', 'zinc', 'nickel']
+    .map(k => calcBasis(p, fx, k))
+    .filter(v => v != null);
+  const basisAvg = basisVals.length ? basisVals.reduce((a, b) => a + b, 0) / basisVals.length : null;
+  const basisScore = signScore(basisAvg, 100, -100);
+
+  const importPnls = ['nickel', 'copper', 'zinc']
+    .map(k => importParity[k]?.pnl)
+    .filter(v => v != null);
+  const importAvg = importPnls.length ? importPnls.reduce((a, b) => a + b, 0) / importPnls.length : null;
+  const importScore = signScore(importAvg, 200, -200);
+
+  const demandVals = [p.copper?.cnyChange, p.zinc?.cnyChange, p.nickel?.cnyChange].filter(v => v != null);
+  const demandAvg = demandVals.length ? demandVals.reduce((a, b) => a + b, 0) / demandVals.length : null;
+  const demandScore = signScore(demandAvg, 0, 0);
+
+  const scores = { '庫存趨勢': invScore, '基差/升貼水': basisScore, '進口盈虧': importScore, '需求/成交': demandScore };
+  lines.push(Object.entries(scores).map(([k, v]) => `${k}:${v}`).join('  |  '));
+  lines.push(`總結：${summarizeScores(scores)}（+ 看多 / - 看空 / 0 中性）`);
+  lines.push('');
+
+  // ── 七、市场情绪与机构观点（简报版：结论 > 证据 > 影响） ──
+  lines.push('━━━ 七、市場情緒與機構觀點 ━━━');
 
   const ibItems = freshNews(d.ibNews);
   const forum = d.forumSentiment;
   const cnNews = freshNews(d.news);
 
-  // 机构观点（文字提炼）
-  const ibSummaries = [];
-  for (const item of ibItems.slice(0, 3)) {
-    const t = item.title || '';
-    // Goldman Sachs / copper target
-    if (/goldman/i.test(t) && /copper/i.test(t)) {
-      ibSummaries.push('高盛維持銅 2026/27 目標區間 10,000–11,000 美元/噸，當前 COMEX 銅折噸價已顯著高於其上限，機構隱含回調警示。');
-    } else if (/jpmorgan|jp morgan/i.test(t) && /nickel/i.test(t)) {
-      ibSummaries.push('摩根大通從中國鎳市場逼倉中獲益，顯示鎳市場多空博弈仍在持續，機構頭寸偏向做多短期波動。');
-    } else if (/citigroup|citi/i.test(t)) {
-      ibSummaries.push(`花旗：${t.split('-')[0].trim()}`);
-    } else if (t) {
-      // 通用提炼：取标题主干
-      const cleaned = t.replace(/\s*-\s*(Reuters|Bloomberg|Mining\.com|FT|WSJ).*$/i, '').trim();
-      ibSummaries.push(cleaned);
-    }
+  function mapInstitutionPrefix(t) {
+    if (/goldman/i.test(t)) return '高盛';
+    if (/jpmorgan|jp morgan/i.test(t)) return '摩根大通';
+    if (/citigroup|citi/i.test(t)) return '花旗';
+    if (/morgan stanley/i.test(t)) return '摩根士丹利';
+    if (/bank of america|bofa/i.test(t)) return '美銀';
+    return '機構';
   }
 
-  if (ibSummaries.length > 0) {
-    lines.push('*🏦 機構觀點*');
-    ibSummaries.forEach(s => lines.push(`• ${s}`));
-    lines.push('');
+  function institutionInsight(title) {
+    const t = (title || '').toLowerCase();
+    if (!t) return null;
+
+    if (t.includes('copper') && (t.includes('range') || t.includes('target'))) {
+      return {
+        conclusion: '銅價進入高位區間博弈，追高性價比下降。',
+        evidence: '機構維持區間/目標價表述，偏「估值錨定」而非趨勢上修。',
+        impact: '交易上以回調承接優先，短線不宜在突破位重倉追多。',
+      };
+    }
+    if (t.includes('nickel')) {
+      return {
+        conclusion: '鎳價主邏輯仍是供應擾動與需求韌性的拉鋸。',
+        evidence: '機構新增鎳相關跟蹤，重點落在供應端變化與利潤再分配。',
+        impact: '波動率可能抬升，建議分批與輕倉，避免單邊押注。',
+      };
+    }
+    if (t.includes('zinc')) {
+      return {
+        conclusion: '鋅價偏區間震盪，方向取決於去庫能否延續。',
+        evidence: '機構視角聚焦供給收縮與終端修復速度。',
+        impact: '若庫存繼續去化可偏多，反之維持區間思路。',
+      };
+    }
+    if (t.includes('forecast') || t.includes('outlook')) {
+      return {
+        conclusion: '市場進入預期重定價階段，敘事切換快。',
+        evidence: '機構發布展望類內容，通常對中期預期有再錨定作用。',
+        impact: '應提高對預期差的敏感度，降低純情緒交易比重。',
+      };
+    }
+    return null;
   }
 
-  // 国内市场情绪（从新闻标题提炼）
-  const domesticSignals = [];
-  for (const item of cnNews.slice(0, 5)) {
-    const t = item.title || '';
-    if (/ETF.*上漲|ETF.*反彈|ETF.*漲/.test(t)) {
-      domesticSignals.push('國內有色 ETF 資金今日淨流入，場內情緒邊際修復。');
-    }
-    if (/現貨.*成交|成交.*清淡|清淡/.test(t)) {
-      domesticSignals.push('上海現貨市場成交偏淡，臨近假期前下遊備貨意願不強。');
-    }
-    if (/風險管理|套保|套期保值/.test(t)) {
-      domesticSignals.push('上游企業積極套保，反映對中短期價格下行的防禦需求上升。');
-    }
-    if (/漲幅.*剩|普漲.*告一段落|避險.*失敗/.test(t)) {
-      domesticSignals.push('市場普漲動能衰減，前期資金驅動行情面臨分化壓力。');
-    }
-  }
+  const ibByTitle = new Map(
+    ibItems.map(item => [normText(item.title), item]).filter(([k]) => !!k)
+  );
 
-  // SMM 提炼
-  if (forum?.smmHighlights) {
-    const smm = forum.smmHighlights;
-    if (/美元下跌/.test(smm)) domesticSignals.push('美元走弱對 LME 基本金屬形成短線支撐，但內盤跟漲偏弱。');
-    if (/多晶硅|碳酸鋰|碳酸锂/.test(smm)) domesticSignals.push('新能源板塊（多晶硅、碳酸鋰）同步回調，對鎳鈷需求側情緒構成拖累。');
-    if (/不銹鋼|不锈钢/.test(smm)) domesticSignals.push('不銹鋼期貨偏強，鎳基需求底部支撐可期。');
-  }
+  const institutionLines = section7Delta.ibNew
+    .slice(0, 2)
+    .map(key => {
+      const item = ibByTitle.get(key);
+      const raw = item?.title || '';
+      if (!raw) return null;
+      const inst = mapInstitutionPrefix(raw);
+      const insight = institutionInsight(raw);
+      if (!insight) {
+        return `• ${inst}：未形成可交易新觀點（僅事件更新，暫不納入研判）。`;
+      }
+      return `• ${inst}｜結論：${insight.conclusion} 證據：${insight.evidence} 影響：${insight.impact}`;
+    })
+    .filter(Boolean);
 
-  // Reddit 提炼
-  if (forum?.redditSummary) {
-    const r = forum.redditSummary;
-    if (/gold.*safe.haven|safe.haven.*gold/i.test(r)) {
-      domesticSignals.push('海外社群對黃金避險屬性出現分歧，能源/商品替代避險邏輯升溫，間接利好基本金屬資產配置。');
-    }
-    if (/silver/i.test(forum.redditSurging || '')) {
-      domesticSignals.push('白銀社群討論熱度異常攀升，貴金屬向基本金屬情緒擴散值得關注。');
-    }
-  }
-
-  if (domesticSignals.length > 0) {
-    lines.push('*📡 市場情緒*');
-    // 去重
-    const unique = [...new Set(domesticSignals)];
-    unique.forEach(s => lines.push(`• ${s}`));
+  lines.push('*🏦 機構觀點（研報摘要）*');
+  if (institutionLines.length) {
+    institutionLines.forEach(x => lines.push(x));
   } else {
-    lines.push('*📡 市場情緒*');
-    lines.push('• 今日市場情緒中性，無顯著異動信號。');
+    lines.push('• 今日無可量化的新機構觀點，維持昨日框架。');
   }
   lines.push('');
 
-  // ── 六、四维交叉推理与操作参考 ──
-  lines.push('━━━ 六、四維交叉推理 ━━━');
+  const sentimentEvidence = [];
+  const sentimentImpact = [];
+
+  for (const item of cnNews.slice(0, 6)) {
+    const t = item.title || '';
+    if (/ETF.*上漲|ETF.*反彈|ETF.*漲/.test(t)) {
+      sentimentEvidence.push('場內有色ETF走強。');
+      sentimentImpact.push('風險偏好修復，但持續性仍需成交配合。');
+    }
+    if (/現貨.*成交|成交.*清淡|清淡/.test(t)) {
+      sentimentEvidence.push('現貨成交偏淡。');
+      sentimentImpact.push('上漲更多由預期驅動，現貨跟隨不足。');
+    }
+    if (/普漲.*告一段落|避險.*失敗|漲幅.*剩/.test(t)) {
+      sentimentEvidence.push('普漲敘事降溫。');
+      sentimentImpact.push('板塊可能由全面上行轉向分化輪動。');
+    }
+  }
+
+  if (forum?.smmHighlights) {
+    if (/美元下跌/.test(forum.smmHighlights)) {
+      sentimentEvidence.push('美元走弱。');
+      sentimentImpact.push('對外盤金屬有短線支撐。');
+    }
+    if (/多晶硅|碳酸鋰|碳酸锂/.test(forum.smmHighlights)) {
+      sentimentEvidence.push('新能源鏈波動加大。');
+      sentimentImpact.push('鎳鈷情緒面承壓，彈性但不穩定。');
+    }
+  }
+
+  lines.push('*📡 市場情緒（三句結論）*');
+  const hasSentimentDelta = section7Delta.cnNew.length > 0 || section7Delta.smmChanged || section7Delta.redditChanged;
+  if (hasSentimentDelta && (sentimentEvidence.length || sentimentImpact.length)) {
+    const ev = [...new Set(sentimentEvidence)].slice(0, 3).join('、') || '新增證據有限';
+    const im = [...new Set(sentimentImpact)].slice(0, 3).join('、') || '對價格影響中性';
+    lines.push(`• 結論：短線情緒修復但分化加劇。`);
+    lines.push(`• 證據：${ev}。`);
+    lines.push(`• 影響：${im}。`);
+  } else {
+    lines.push('• 結論：情緒面無新增有效信號，維持中性。');
+  }
+  lines.push('');
+
+  // ── 八、四维交叉推理与操作参考 ──
+  lines.push('━━━ 八、四維交叉推理 ━━━');
 
   // 宏观维度
   let macroText = '';
@@ -406,16 +620,30 @@ function buildReport(d) {
   lines.push(`③ 結構維度：${fwdText}`);
   lines.push('');
 
-  // 情绪维度
+  // 情绪维度（基于当日信号汇总，中文表述，若為英文保留「英文原文」前缀以確保準確）
   const sentParts = [];
-  if (ibItems.some(i => /goldman/i.test(i.title || ''))) sentParts.push('高盛報告引發市場估值修正討論');
-  if (ibItems.some(i => /jpmorgan|jp morgan/i.test(i.title || ''))) sentParts.push('摩根大通鎳市持倉動向值得跟蹤');
-  if (forum?.redditSurging?.toLowerCase().includes('silver')) sentParts.push('海外社群白銀討論異動，貴金屬情緒有向基本金屬傳導跡象');
-  if (forum?.smmHighlights?.includes('多晶硅') || forum?.smmHighlights?.includes('碳酸')) sentParts.push('新能源鏈回調對鎳鈷需求敘事形成干擾');
+  if (sentimentEvidence.length > 0 || sentimentImpact.length > 0) sentParts.push('今日有色相關新聞/社群出現多條異動，詳見上文情緒研判');
+  if (forum?.redditSurging) sentParts.push(`Reddit 熱點（英文原文）：${clamp(forum.redditSurging)}`);
+  if (forum?.smmHighlights) sentParts.push(`SMM 摘要：${clamp(forum.smmHighlights)}`);
   const sentText = sentParts.length > 0
     ? sentParts.join('；') + '。'
-    : '市場情緒中性，無顯著異動，短線跟隨基本面邏輯為主。';
+    : '市場情緒中性，暫無顯著異動信號。';
   lines.push(`④ 情緒維度：${sentText}`);
+
+  lines.push('');
+  lines.push('━━━ 九、宏觀風險溫度計 ━━━');
+  const dxy = macro.find(m => ['^DXY', 'DX-Y.NYB', 'DX=F'].includes(m.symbol));
+  const vix = macro.find(m => m.symbol === '^VIX');
+  const crb = macro.find(m => ['CRY', 'TRJEFFCR', '^CRB'].includes(m.symbol));
+  const tnx = macro.find(m => m.symbol === '^TNX');
+  const macroLines = [];
+  const macroMsg = [];
+  if (dxy) { macroLines.push(`DXY ${dxy.price?.toFixed(2)} ${fmtPct(dxy.changePct)}`); if (dxy.changePct > 0.3) macroMsg.push('美元走強對大宗偏空'); else if (dxy.changePct < -0.3) macroMsg.push('美元走弱利好商品定價'); }
+  if (vix) { macroLines.push(`VIX ${vix.price?.toFixed(2)} ${fmtPct(vix.changePct)}`); if (vix.price > 18 || vix.changePct > 5) macroMsg.push('波動上升，風險偏好降'); }
+  if (crb) macroLines.push(`CRB ${crb.price?.toFixed(2)} ${fmtPct(crb.changePct)}`);
+  if (tnx) { macroLines.push(`美債10Y ${tnx.price?.toFixed(2)}% ${fmtPct(tnx.changePct)}`); if (tnx.changePct > 0.5) macroMsg.push('利率上行，成本壓力↑'); }
+  lines.push(macroLines.length ? macroLines.join('  |  ') : '宏觀指標暫缺');
+  lines.push(`溫度計：${macroMsg.length ? macroMsg.join('；') : '風險情緒中性'}`);
 
   lines.push('');
   lines.push('📌 *操作參考（非投資建議）*');
@@ -504,7 +732,13 @@ function buildReport(d) {
   lines.push('');
   lines.push('_數據來源：Yahoo Finance / CCMN / SMM / Westmetall / TradingEconomics / Reuters_');
 
-  return lines.join('\n');
+  return {
+    message: lines.join('\n'),
+    state: {
+      generatedAt: new Date().toISOString(),
+      section7: section7Snapshot,
+    },
+  };
 }
 
 // ────────────────────────────────────────────
@@ -534,7 +768,8 @@ async function main() {
 
   process.stderr.write('[daily-report] 数据抓取完成，生成报告...\n');
 
-  const message = buildReport(data);
+  const prevState = loadReportState();
+  const { message, state } = buildReport(data, prevState);
 
   console.log('\n─── 报告预览 ───');
   console.log(message);
@@ -543,14 +778,21 @@ async function main() {
   const env = loadEnv();
   const token = env.TELEGRAM_BOT_TOKEN;
   const chatId = env.TELEGRAM_CHAT_ID;
+  const dryRun = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true';
 
   if (!token) {
     process.stderr.write('[daily-report] ⚠️  未配置 TELEGRAM_BOT_TOKEN，跳过发送\n');
     return;
   }
 
+  if (dryRun) {
+    process.stderr.write('[daily-report] 🧪 DRY_RUN=1，僅打印預覽不發送 Telegram\n');
+    return;
+  }
+
   process.stderr.write(`[daily-report] 发送至 Telegram chat_id=${chatId}...\n`);
   await sendTelegram(token, chatId, message);
+  saveReportState(state);
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
   process.stderr.write(`[daily-report] ✅ 发送成功！总耗时: ${elapsed}s\n`);
 }
