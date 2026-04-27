@@ -212,6 +212,32 @@ async function fetchYahoo(symbol) {
   }
 }
 
+// 周环比（较约5个交易日前收盘）
+async function fetchYahooWoW(symbol) {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1mo`;
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const result = data?.chart?.result?.[0];
+    const closes = result?.indicators?.quote?.[0]?.close?.filter(v => v != null) || [];
+    if (closes.length < 6) return null;
+    const last = closes[closes.length - 1];
+    const prevWeek = closes[closes.length - 6]; // 约5个交易日前
+    if (last == null || prevWeek == null || prevWeek === 0) return null;
+    return +(((last - prevWeek) / prevWeek) * 100).toFixed(2);
+  } catch (err) {
+    process.stderr.write(`[fetch-all-data] Yahoo WoW ${symbol} 錯誤: ${err.message}\n`);
+    return null;
+  }
+}
+
 // USD/CNY 匯率（Yahoo Finance + 備援）
 async function fetchUsdcny() {
   // A) Yahoo（主來源）
@@ -274,7 +300,10 @@ async function fetchMetalIndices() {
   ];
 
   const results = await Promise.all(symbols.map(async ({ symbol, name, market, currency }) => {
-    const data = await fetchYahoo(symbol);
+    const [data, wowPct] = await Promise.all([
+      fetchYahoo(symbol),
+      fetchYahooWoW(symbol),
+    ]);
     if (!data.ok || data.price === null) return null;
     const changeAbs = (data.price != null && data.changePct != null)
       ? +(data.price * data.changePct / (100 + data.changePct)).toFixed(3)
@@ -287,6 +316,7 @@ async function fetchMetalIndices() {
       price: data.price,
       changePct: data.changePct,
       changeAbs,
+      wowPct,
     };
   }));
 
